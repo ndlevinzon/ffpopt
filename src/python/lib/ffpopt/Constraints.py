@@ -817,7 +817,7 @@ def EnforceConstraintsFromOpt(atoms,cons,rests,k=1.):
     oatoms.calc = RestrainedCalculator(nullcalc,rlist.rests)
     #oatoms.calc = nullcalc
     
-    optimizer = BFGS(oatoms)
+    optimizer = BFGS(oatoms, logfile=None)
     optimizer.run(fmax=1.e-2,steps=500)
     oatoms.calc = None
 

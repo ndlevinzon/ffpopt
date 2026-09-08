@@ -36,7 +36,6 @@ def GeomOpt_ASE(los,struct,constraints=None,restraints=None):
     from . Restraints import RestraintList
     from . Constraints import ApplyConstraints, to_ase
     from . AseEngine import get_persistent_calc
-    import sys
     
     if True:
         
@@ -103,8 +102,7 @@ def GeomOpt_ASE(los,struct,constraints=None,restraints=None):
         myatoms.set_constraint( asecons )
         myatoms.calc = calc
         myatoms.calc.reset()
-        logfile = sys.stderr
-        optimizer = BFGS(myatoms,logfile=logfile)
+        optimizer = BFGS(myatoms, logfile=None)
         optimizer.run(fmax=los.args.ase_opt_tol,steps=los.args.geometric_maxiter)
         
         ene = myatoms.get_potential_energy()

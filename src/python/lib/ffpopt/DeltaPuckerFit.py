@@ -862,6 +862,7 @@ def RunDeltaPuckerFit\
 
     import os
     import shutil
+    import sys
     import argparse
     import subprocess
     from types import SimpleNamespace
@@ -927,10 +928,9 @@ def RunDeltaPuckerFit\
         
         fitobj.write_parmed(f"{base}.py")
         
-        subprocess.run(["python3",
-                        f"{base}.py",
-                        f"{base}.inp.parm7",
-                        modparm],
-                       check=True)
+        subprocess.run(
+            [sys.executable or "python3", f"{base}.py", f"{base}.inp.parm7", modparm],
+            check=True,
+        )
 
         os.remove(f"{base}.inp.parm7")

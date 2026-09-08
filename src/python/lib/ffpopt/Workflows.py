@@ -1,9 +1,15 @@
 import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _python() -> str:
+    """Interpreter that imported ffpopt (conda ``python``, not a stray ``python3``)."""
+    return sys.executable or "python3"
 
 
 class _TwistParam(object):
@@ -343,8 +349,11 @@ def _run_gendihedfit(citname: str, nlmaxiter: int, skip_existing: bool) -> None:
         print(f"[twist] {citname}.py exists — skipping GenDihedFit.")
         return
     print(f"[twist] GenDihedFit → {citname}.py")
+    gendihed = shutil.which("ffpopt-GenDihedFit.py")
+    if gendihed is None:
+        raise FileNotFoundError("ffpopt-GenDihedFit.py is not on PATH")
     subprocess.run(
-        ["ffpopt-GenDihedFit.py", f"--nlmaxiter={nlmaxiter}", f"{citname}.fit.json"],
+        [_python(), gendihed, f"--nlmaxiter={nlmaxiter}", f"{citname}.fit.json"],
         check=True,
     )
 
@@ -417,10 +426,11 @@ def _apply_fit_and_prepare(
 ) -> None:
     """ Apply the fit script to ``origparm`` and rebuild the JSON input.
 
-    Runs ``python3 <citname>.py origparm <citname>.parm7`` to bake the new
-    torsion terms into a fresh parm7, then ``ffpopt-PrepareInput.py
-    --update`` to produce ``<citname>.json``. FUTURE: replace subprocess
-    calls with API calls once PrepareInput is refactored.
+    Runs ``python <citname>.py origparm <citname>.parm7`` (same interpreter
+    as this process) to bake the new torsion terms into a fresh parm7, then
+    ``ffpopt-PrepareInput.py --update`` to produce ``<citname>.json``.
+    FUTURE: replace subprocess calls with API calls once PrepareInput is
+    refactored.
 
     Parameters
     ----------
@@ -441,11 +451,17 @@ def _apply_fit_and_prepare(
         print(f"[twist] {parm_out} & {json_out} exist — skipping apply+prepare.")
         return
     print(f"[twist] applying fit → {parm_out}")
-    subprocess.run(["python3", f"{citname}.py", origparm, parm_out], check=True)
+    subprocess.run(
+        [_python(), f"{citname}.py", origparm, parm_out], check=True
+    )
     print(f"[twist] PrepareInput → {json_out}")
+    prepare = shutil.which("ffpopt-PrepareInput.py")
+    if prepare is None:
+        raise FileNotFoundError("ffpopt-PrepareInput.py is not on PATH")
     subprocess.run(
         [
-            "ffpopt-PrepareInput.py",
+            _python(),
+            prepare,
             "--update",
             f"--parm={parm_out}",
             f"--crd={inp}",
@@ -928,9 +944,13 @@ def _prepare_fragment_input(fragment, skip_existing: bool) -> str:
         print("[frag-twist] start.json exists — skipping PrepareInput")
         return "start.json"
     print(f"[frag-twist] PrepareInput → start.json (in {Path.cwd()})")
+    prepare = shutil.which("ffpopt-PrepareInput.py")
+    if prepare is None:
+        raise FileNotFoundError("ffpopt-PrepareInput.py is not on PATH")
     subprocess.run(
         [
-            "ffpopt-PrepareInput.py",
+            _python(),
+            prepare,
             f"--parm={fragment.parm7_path.name}",
             f"--crd={fragment.rst7_path.name}",
             "--out=start.json",

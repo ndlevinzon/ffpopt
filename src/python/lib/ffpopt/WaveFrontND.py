@@ -234,7 +234,14 @@ class WavefrontNode(object):
             The name of the pckl file
         """
         s = "~".join( [ "%.2f"%(x) for x in self.rcs ] )
-        return f"level_{self.level}_rcs_{s}_id_{self.node_id}_node.pckl"
+        tags = []
+        if self.conlist is not None:
+            for c in self.conlist:
+                idxs = getattr(c, "idxs", None) or ()
+                if idxs:
+                    tags.append("-".join(str(int(i)) for i in idxs))
+        prefix = ("__".join(tags) + "_") if tags else ""
+        return f"{prefix}level_{self.level}_rcs_{s}_id_{self.node_id}_node.pckl"
 
     @classmethod
     def from_job(cls, job: dict, los: ListOfStruct, conlist=None, reslist=None) -> "WavefrontNode":
@@ -366,15 +373,9 @@ class WavefrontNode(object):
 
     def cleanup(self) -> None:
         """Clean up the node's pickle file."""
-        filename = Path(f"{self.node_pkl}")
-        #if Path.is_file(filename):
-        if filename.is_file():
-            try:
-                print(f"Remove node {self.node_pkl}")
-                os.remove(filename)
-            except:
-                #filename.unlink(missing_ok=True)
-                print(f"Failed to remove {self.node_pkl} because it disappeared")
+        from . WavefrontIpc import remove_node_pickle
+
+        remove_node_pickle(self.node_pkl)
 
     def _mark_failed(self, reason: str, error: Optional[Exception] = None) -> None:
         msg = reason

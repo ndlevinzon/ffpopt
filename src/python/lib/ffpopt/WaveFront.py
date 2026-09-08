@@ -109,6 +109,15 @@ def _run_node(node: "WavefrontNode") -> "WavefrontNode":
     return node
 
 
+def _node_pkl_name(con, level, angle, node_id) -> str:
+    """Sidecar pickle name, unique per dihedral so parallel bond scans do not collide."""
+    idxs = getattr(con, "idxs", None) or ()
+    prefix = ""
+    if idxs:
+        prefix = "_".join(str(int(i)) for i in idxs) + "_"
+    return f"{prefix}level_{level}_angle_{angle}_id_{node_id}_node.pckl"
+
+
 class WavefrontNode:
     """ This is a node in the wavefront algorithm. It represents a single geometry optimization.
 
@@ -160,7 +169,7 @@ class WavefrontNode:
         self.level = level
         self.node_id = node_id
         #self.stdargs = stdargs
-        self.node_pkl = f"level_{self.level}_angle_{self.angle}_id_{self.node_id}_node.pckl"
+        self.node_pkl = _node_pkl_name(con, level, angle, node_id)
         self.complete = False
         self.error = None
 
@@ -279,10 +288,9 @@ class WavefrontNode:
 
     def cleanup(self) -> None:
         """Clean up the node's pickle file."""
-        filename = Path(f"{self.node_pkl}")
-        if Path.is_file(filename):
-            print("Cleaning up node pickle file:", self.node_pkl)
-            os.remove(filename)
+        from . WavefrontIpc import remove_node_pickle
+
+        remove_node_pickle(self.node_pkl)
 
     def _mark_failed(self, reason: str, error: Optional[Exception] = None) -> None:
         msg = reason

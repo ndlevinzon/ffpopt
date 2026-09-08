@@ -149,6 +149,19 @@ def write_node_pickle(node: Any, *, verbose: bool = False) -> None:
         node.los = los
 
 
+def remove_node_pickle(node_pkl: PathLike) -> None:
+    """Delete a node sidecar pickle; a missing file is not an error.
+
+    Parallel bond scans in one directory can share a basename, NFS/VAST can
+    report a file that is already gone, and cleanup runs after the result is
+    already in the wavefront checkpoint.
+    """
+    try:
+        Path(node_pkl).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def pickle_checkpoint_keep_calc_cache(obj: Any, path, los) -> None:
     """Pickle a wavefront after unbinding ``los.calc``, then restore it.
 

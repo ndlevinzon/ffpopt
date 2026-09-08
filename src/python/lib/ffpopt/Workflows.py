@@ -54,7 +54,95 @@ class _TwistParam(object):
         return [f"@{n}" for n in self.names]
 
 
-def _resolve_scans_and_params(mol, bonds, nprim: int, bytype: bool):
+def _effective_scans_per_type(bytype: bool, scans_per_type) -> int:
+    """How many central bonds to scan per atom-type family.
+
+    ``bytype`` fits one Fourier series per type, so extra bonds of the same
+    types are redundant. ``0`` or a non-positive value means scan every bond.
+    """
+    if not bytype:
+        return 0
+    if scans_per_type is not None:
+        return int(scans_per_type)
+    return 2
+
+
+def _twist_records_for_bonds(mol, bonds):
+    """One record per central bond: the scanned 4-atom dihedral and all type families on that bond."""
+    records = []
+    for bond in bonds:
+        pair = [int(bond[0]), int(bond[1])]
+        scan = None
+        types: list[str] = []
+        for d in mol.dihedrals:
+            if d.improper:
+                continue
+            idxs = [d.atom1.idx, d.atom2.idx, d.atom3.idx, d.atom4.idx]
+            if idxs[1] == pair[0] and idxs[2] == pair[1]:
+                myidxs = idxs
+            elif idxs[2] == pair[0] and idxs[1] == pair[1]:
+                myidxs = idxs[::-1]
+            else:
+                continue
+            p = _TwistParam(mol, myidxs)
+            types.append(p.GetParamByType())
+            if scan is None:
+                scan = p
+        if scan is None:
+            raise ValueError(
+                f"--bond {pair[0]},{pair[1]} has no proper dihedral with that "
+                f"pair as the central bond. This usually means at least one of "
+                f"the two atoms is terminal (no bonded neighbors beyond the "
+                f"other). Check your bond indices (0-based) against the parm "
+                f"topology."
+            )
+        records.append({"bond": pair, "scan": scan, "types": types})
+    return records
+
+
+def _select_bytype_representatives(records, n_per_type: int):
+    """Keep the first bonds that cover each type family up to ``n_per_type`` times.
+
+    A homogeneous alkyl tail (twelve ``c3-c3`` bonds) collapses to two scans.
+    A unique head-group type still adds its own bond.
+    """
+    if n_per_type <= 0 or len(records) <= n_per_type:
+        return list(records)
+    type_order: list[str] = []
+    for rec in records:
+        for name in rec["types"]:
+            if name not in type_order:
+                type_order.append(name)
+    counts = {name: 0 for name in type_order}
+    selected = []
+    seen: set[tuple[int, int]] = set()
+    for rec in records:
+        key = (rec["bond"][0], rec["bond"][1])
+        if key in seen:
+            continue
+        if any(counts[name] < n_per_type for name in rec["types"]):
+            selected.append(rec)
+            seen.add(key)
+            for name in rec["types"]:
+                counts[name] += 1
+    for name in type_order:
+        if counts[name] > 0:
+            continue
+        for rec in records:
+            if name not in rec["types"]:
+                continue
+            key = (rec["bond"][0], rec["bond"][1])
+            if key in seen:
+                break
+            selected.append(rec)
+            seen.add(key)
+            for other in rec["types"]:
+                counts[other] += 1
+            break
+    return selected
+
+
+def _resolve_scans_and_params(mol, bonds, nprim: int, bytype: bool, scans_per_type=None):
     """ Walk ``mol.dihedrals`` once per bond, build the scan list and fit params.
 
     Parameters
@@ -67,14 +155,18 @@ def _resolve_scans_and_params(mol, bonds, nprim: int, bytype: bool):
     nprim : int
         Number of primary cosine terms to fit per parameter family.
     bytype : bool
-        If True, fit-input masks are by atom *type* (one entry per unique
-        type string). If False, masks list every atom-name instance
-        explicitly.
+        If True, fit-input masks are by atom *type* rather than by
+        explicit atom-name instances. When True, only a few representative
+        central bonds are scanned per type family (see ``scans_per_type``).
+    scans_per_type : int, optional
+        Max scans per type family when ``bytype`` is True. Default 2.
+        ``0`` scans every bond.
 
     Returns
     -------
     scans : list of _TwistParam
-        One entry per bond (its first matching proper dihedral).
+        One entry per scanned bond (a subset when ``bytype`` collapses
+        duplicate type families).
     params : dict
         Maps parameter name → ``{'nprim': nprim, 'masks': ...}`` for the
         ``ffpopt-GenDihedFit.py`` input.
@@ -82,6 +174,19 @@ def _resolve_scans_and_params(mol, bonds, nprim: int, bytype: bool):
         Per-system fit-input template with ``params`` filled in and
         ``profiles`` empty.
     """
+    bonds = [[int(b[0]), int(b[1])] for b in bonds]
+    n_keep = _effective_scans_per_type(bytype, scans_per_type)
+    if n_keep > 0:
+        records = _twist_records_for_bonds(mol, bonds)
+        selected = _select_bytype_representatives(records, n_keep)
+        if len(selected) < len(records):
+            print(
+                "[twist] bytype representatives: %s bond(s) -> %s scan(s) "
+                "(≤%s per type family)"
+                % (len(records), len(selected), n_keep)
+            )
+        bonds = [rec["bond"] for rec in selected]
+
     scans = []
     allparams = []
     ps = {}
@@ -491,6 +596,7 @@ def run_dihed_twist_workflow(
     convergence_mode: str = "drop",
     plot_comparisons: bool = False,
     structure_images: dict | None = None,
+    scans_per_type: int | None = None,
     **standard_kwargs,
 ) -> dict:
     """ Wavefront-only twist workflow, run in-process.
@@ -526,6 +632,12 @@ def run_dihed_twist_workflow(
     bytype : bool, optional
         If True, fit-input masks are by atom *type* rather than by
         explicit atom-name instances. Default is False.
+    scans_per_type : int, optional
+        When ``bytype`` is True, scan at most this many central bonds per
+        atom-type Fourier family (default 2). Extra copies of the same
+        types (a detergent alkyl tail) are not scanned; the fitted
+        parameters still apply to every instance. ``0`` or a negative
+        value scans every bond. Ignored when ``bytype`` is False.
     nlmaxiter : int, optional
         Forwarded as ``--nlmaxiter`` to ``ffpopt-GenDihedFit.py``.
         Default is 300.
@@ -642,7 +754,7 @@ def run_dihed_twist_workflow(
 
     bonds_parsed = [[int(x) for x in b.split(",")] for b in args.bond]
     scans, params, s_template = _resolve_scans_and_params(
-        mol, bonds_parsed, nprim=nprim, bytype=bytype
+        mol, bonds_parsed, nprim=nprim, bytype=bytype, scans_per_type=scans_per_type
     )
 
     # Common wavefront kwargs, reused on every _run_one_scan call.
@@ -697,7 +809,7 @@ def run_dihed_twist_workflow(
         )
         results["initial_comparisons"] = initial
         kept_bonds = []
-        for bond, scan in zip(bonds_parsed, scans):
+        for scan in scans:
             idx = scan.GetIdxStr()
             r = initial[idx]
             if r.is_close:
@@ -705,7 +817,7 @@ def run_dihed_twist_workflow(
                     else "agrees with HL within thresholds"
                 print(f"[twist] {idx}: {reason} — dropping from iterative fit")
             else:
-                kept_bonds.append(bond)
+                kept_bonds.append([scan.idxs[1], scan.idxs[2]])
                 reasons = "; ".join(r.reasons) if r.reasons else "extrema disagree"
                 print(f"[twist] {idx}: refit needed ({reasons})")
         if not kept_bonds:
@@ -713,9 +825,13 @@ def run_dihed_twist_workflow(
             from . NondaemonPool import close_reused_wavefront_pool
             close_reused_wavefront_pool()
             return results
-        if len(kept_bonds) < len(bonds_parsed):
+        if len(kept_bonds) < len(scans):
             scans, params, s_template = _resolve_scans_and_params(
-                mol, kept_bonds, nprim=nprim, bytype=bytype
+                mol,
+                kept_bonds,
+                nprim=nprim,
+                bytype=bytype,
+                scans_per_type=scans_per_type,
             )
             print(f"[twist] fitting {len(scans)} of {len(bonds_parsed)} dihedrals")
 
@@ -791,7 +907,11 @@ def run_dihed_twist_workflow(
                     if s.GetIdxStr() in still_off_idxs
                 ]
                 scans, params, s_template = _resolve_scans_and_params(
-                    mol, kept_bonds, nprim=nprim, bytype=bytype
+                    mol,
+                    kept_bonds,
+                    nprim=nprim,
+                    bytype=bytype,
+                    scans_per_type=scans_per_type,
                 )
                 print(
                     f"[twist] {citname}: dropping converged "

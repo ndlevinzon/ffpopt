@@ -630,29 +630,76 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
     y = hlenes-llenes
     
     npts = len(y)
-    npar = nprim + 1
+
+    from .DihedFitRegularize import (
+        apply_chemical_rotor_policy,
+        dense_torsion_ptp,
+        fit_fourier_nprim,
+        nprim_select_enabled,
+        phase_variant_functions,
+        solve_regularized_fcs,
+    )
+
+    def _pad_to_nprim(dfcn):
+        if len(dfcn.prims) == nprim:
+            return dfcn
+        by_per = {p.per: p for p in dfcn.prims}
+        prims = []
+        for n in range(1, nprim + 1):
+            if n in by_per:
+                prims.append(PrimDihedFcn(by_per[n].fc, by_per[n].phase, n))
+            else:
+                prims.append(PrimDihedFcn(0.0, 0.0, n))
+        return MultiDihedFcn(idxs, prims)
+
+    def _score(dfcn):
+        n_fc = len(dfcn.prims)
+        A = np.zeros((npts, n_fc + 1))
+        for iprim, prim in enumerate(dfcn.prims):
+            A[:, iprim] = prim.CptEterm(angs)
+        A[:, n_fc] = 1
+        x, info = solve_regularized_fcs(
+            A, y, dfcn=dfcn, where=pname, n_fc=n_fc
+        )
+        const = float(x[-1])
+        v = np.asarray(dfcn.CptEne(angs), dtype=float) + const
+        d = y - v
+        chisq = float(np.dot(d, d))
+        return chisq, copy.deepcopy(dfcn), v, info
 
     bestdfcn = None
     bestchisq = 1.e+30
     bestvalues = []
-    for ifcn,dfcn in enumerate(dfcns):
-        A = np.zeros( (npts,npar) )
-        for iprim,prim in enumerate(dfcn.prims):
-            A[:,iprim] = prim.CptEterm(angs)
-        A[:,nprim] = 1
-        #AtA = A.T @ A
-        #AtAinv = np.linalg.inv(AtA)
-        #x = AtAinv @ A.T @ y
-        x = np.linalg.pinv(A) @ y
-        const = x[-1]
-        dfcn.SetFCs( x[:-1] )
-        v = dfcn.CptEne(angs) + const
-        d = hlenes - (llenes + v)
-        chisq = np.dot(d,d)
+    if nprim_select_enabled() and nprim >= 1:
+        seed, _x, _info = fit_fourier_nprim(angs, y, nprim, idxs, pname=pname)
+        candidates = [_pad_to_nprim(seed)]
+        if len(seed.prims) <= 4:
+            candidates.extend(phase_variant_functions(idxs, len(seed.prims)))
+    else:
+        candidates = list(dfcns) + phase_variant_functions(idxs, nprim)
+
+    seen = set()
+    for dfcn in candidates:
+        key = tuple((round(p.phase, 1), int(p.per)) for p in dfcn.prims)
+        if key in seen:
+            continue
+        seen.add(key)
+        dfcn = copy.deepcopy(dfcn)
+        chisq, fitted, v, _info = _score(dfcn)
         if chisq < bestchisq:
             bestchisq = chisq
-            bestdfcn = copy.deepcopy(dfcn)
+            bestdfcn = fitted
             bestvalues = v
+
+    if bestdfcn is None:
+        raise RuntimeError(f"IsolatedLinearSolve failed for {pname}")
+    bestdfcn = _pad_to_nprim(bestdfcn)
+    apply_chemical_rotor_policy(bestdfcn, pname, where=pname)
+    print(
+        f"[fit] {pname}: PKs={[round(p.fc, 4) for p in bestdfcn.prims]} "
+        f"phases={[p.phase for p in bestdfcn.prims]} "
+        f"ptp={dense_torsion_ptp(bestdfcn):.2f} kcal/mol chisq={bestchisq:.4g}"
+    )
 
     fh = open(f"iso.{pname}.dat","w")
     fh.write("# %s\n"%(str(bestdfcn)))
@@ -1349,8 +1396,11 @@ def DihedFitObjFcn(x,self):
     import os
     
     KCAL_PER_EV = AU_PER_ELECTRON_VOLT() / AU_PER_KCAL_PER_MOL()
+    from .DihedFitRegularize import dihed_fc_abs_max
+
+    cap = dihed_fc_abs_max()
+    x = np.clip(np.asarray(x, dtype=float), -cap, cap)
   
-    
     chisq = 0
 
     it = self.iteration
@@ -1472,29 +1522,34 @@ def NonlinearSolve(args,finp):
 
     #objfcn = NonlinearObjective(stdargs,udscans)
     
+    from .DihedFitRegularize import clip_dihed_fcs, dihed_fc_abs_max
+
     n = finp.get_num_params()
     x = finp.make_initial_guesses()
-
-    #x[:] = 0.
-    xlo = x[:] - 2.
-    xhi = x[:] + 5.
-    bounds = [ (lo,hi) for lo,hi in zip(xlo,xhi) ]
+    cap = dihed_fc_abs_max()
+    x = clip_dihed_fcs(x, where="nonlinear-x0")
+    bounds = [(-cap, cap) for _ in range(n)]
 
     for s in finp.systems:
         for p in s.profiles:
             p.losll.SetArgs(args)
-    
-    res = minimize( DihedFitObjFcn, x, args=(finp,),
-                    method='COBYLA',
-                    bounds=bounds,
-                    options={ "rhobeg": args.nlrhobeg,
-                              "tol": args.nltol,
-                              "maxiter": args.nlmaxiter,
-                              "disp": True })
+
+    res = minimize(
+        DihedFitObjFcn,
+        x,
+        args=(finp,),
+        method="COBYLA",
+        bounds=bounds,
+        options={
+            "rhobeg": args.nlrhobeg,
+            "tol": args.nltol,
+            "maxiter": args.nlmaxiter,
+            "disp": True,
+        },
+    )
 
     print(res)
-
-    finp.set_params(res.x)
+    finp.set_params(clip_dihed_fcs(res.x, where="nonlinear-x"))
 
 
 

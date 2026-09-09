@@ -203,47 +203,44 @@ def classify_dihed_rotor(type_key: str) -> str:
 
 
 def apply_sp3_rotor_policy(dfcn, type_key: str, *, where: str = ""):
-    """Zero or cap PKs that would give an unphysical isolated-torsion barrier."""
+    """Cap PKs that would give an unphysical isolated-torsion barrier.
+
+    Never writes all-zero PKs: ``deleteDihedral`` + ``addDihedral(PK=0)``
+    removes the original GAFF cosine and leaves a flat MM DIHE panel.
+    """
 
     ptp = dense_torsion_ptp(dfcn)
     kind = classify_dihed_rotor(type_key)
     sp3_max = _envf("FFPOPT_DIHED_SP3_BARRIER_MAX", 20.0)
     alk_max = _envf("FFPOPT_DIHED_ALKANE_BARRIER_MAX", 5.0)
     polar_max = _envf("FFPOPT_DIHED_POLAR_SP3_BARRIER_MAX", 8.0)
-    sul_max = _envf("FFPOPT_DIHED_SULFATE_BARRIER_MAX", 10.0)
     sul_cap = _envf("FFPOPT_DIHED_SULFATE_BARRIER_CAP", 4.0)
 
     action = "keep"
     if kind == "sulfate_phosphate":
-        if ptp > sul_max:
-            dfcn.SetFCs([0.0] * len(dfcn.prims))
-            action = "zero_sulfate_phosphate"
-        elif ptp > sul_cap:
-            _scale_fcs_to_ptp(dfcn, sul_cap)
+        if ptp > sul_cap:
+            scale_fcs_to_ptp(dfcn, sul_cap)
             action = "cap_sulfate_phosphate"
     elif kind == "alkane":
-        if ptp > sp3_max:
-            dfcn.SetFCs([0.0] * len(dfcn.prims))
-            action = "zero_alkane"
-        elif ptp > alk_max:
-            _scale_fcs_to_ptp(dfcn, alk_max)
+        if ptp > alk_max:
+            scale_fcs_to_ptp(dfcn, alk_max)
             action = "cap_alkane"
     elif kind == "amine_ammonium":
         if ptp > polar_max:
-            _scale_fcs_to_ptp(dfcn, polar_max)
+            scale_fcs_to_ptp(dfcn, polar_max)
             action = "cap_amine_ammonium"
     elif kind == "alcohol_ether":
         if ptp > polar_max:
-            _scale_fcs_to_ptp(dfcn, polar_max)
+            scale_fcs_to_ptp(dfcn, polar_max)
             action = "cap_alcohol_ether"
     elif kind == "polar_sp3":
         if ptp > polar_max:
-            _scale_fcs_to_ptp(dfcn, polar_max)
+            scale_fcs_to_ptp(dfcn, polar_max)
             action = "cap_polar_sp3"
     elif kind == "sp3_sp3":
         if ptp > sp3_max:
-            dfcn.SetFCs([0.0] * len(dfcn.prims))
-            action = "zero_sp3_sp3"
+            scale_fcs_to_ptp(dfcn, sp3_max)
+            action = "cap_sp3_sp3"
 
     if where and action != "keep":
         print(

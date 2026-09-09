@@ -642,6 +642,15 @@ def compare_scan_files(
             angles, v_target, v_mm = isolate_dihedral_profiles(
                 a_hl, e_hl, a_ll, e_ll, fcn.CptEne
             )
+            v_ptp = float(np.max(v_mm) - np.min(v_mm)) if len(v_mm) else 0.0
+            if v_ptp < 0.05:
+                pks = [round(float(p.fc), 4) for p in fcn.prims]
+                print(
+                    f"[plot] MM DIHE is flat for {list(dihed_idxs)} in "
+                    f"{parm_path} (ptp={v_ptp:.3f} kcal/mol, PKs={pks}). "
+                    "This quartet has no Fourier amplitude; leftover is "
+                    "E_HL-E_MM, not an isolated torsion."
+                )
             dihed_cmp = compare_scans(angles, v_target, angles, v_mm, config=config)
             plot_comparison(
                 angles,

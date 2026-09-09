@@ -1664,9 +1664,18 @@ def WriteParmedScript(fname,p,dfcns): #,bytype):
 
         for masks in allmasks:
             mstr = ",".join(["f\"%s\""%(mask) for mask in masks])
+            nonzero = [prim for prim in dfcn.prims if abs(float(prim.fc)) > 1.0e-8]
+            if not nonzero:
+                fh.write(
+                    f"# skip quartet {dfcn.idxs}: all PKs ~ 0 "
+                    "(keep original GAFF terms)\n\n"
+                )
+                continue
             fh.write(f"deleteDihedral(p,{mstr}).execute()\n")
-            for prim in dfcn.prims:
-                fh.write(f"addDihedral(p,{mstr},{prim.fc},{prim.per},{prim.phase},scee,scnb).execute()\n")
+            for prim in nonzero:
+                fh.write(
+                    f"addDihedral(p,{mstr},{prim.fc},{prim.per},{prim.phase},scee,scnb).execute()\n"
+                )
             fh.write("\n\n")
 
     fh.write("p.save(args.oparm,overwrite=True)\n")

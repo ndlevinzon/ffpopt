@@ -143,8 +143,8 @@ def test_sp3_rotor_policy_zero_and_alkane_cap():
     stiff.SetFCs([15.4])
     with patch.dict(os.environ, policy_env, clear=False):
         out, action, ptp = apply_sp3_rotor_policy(stiff, "CHA_c3-c3-s6-o", where="test")
-    assert action == "zero_sulfate_phosphate"
-    assert float(out.prims[0].fc) == pytest.approx(0.0)
+    assert action == "cap_sulfate_phosphate"
+    assert dense_torsion_ptp(out) <= 4.0 * 1.05
     assert ptp > 10.0
 
     alk = GetDihedClasses(idxs=[0, 1, 2, 3])[1][0]
@@ -183,8 +183,8 @@ def test_sp3_rotor_policy_zero_and_alkane_cap():
         out, action, ptp = apply_sp3_rotor_policy(
             sugar_h, "h1-c3-c6-c6", where="test"
         )
-    assert action == "zero_alkane"
-    assert float(out.prims[0].fc) == pytest.approx(0.0)
+    assert action == "cap_alkane"
+    assert dense_torsion_ptp(out) <= 5.0 * 1.05
     assert ptp > 20.0
 
     sugar_alk = GetDihedClasses(idxs=[0, 1, 2, 3])[1][0]
@@ -202,8 +202,8 @@ def test_sp3_rotor_policy_zero_and_alkane_cap():
         out, action, ptp = apply_sp3_rotor_policy(
             sugar_cc, "oh-c3-c6-os", where="test"
         )
-    assert action == "zero_sp3_sp3"
-    assert float(out.prims[0].fc) == pytest.approx(0.0)
+    assert action == "cap_sp3_sp3"
+    assert dense_torsion_ptp(out) <= 20.0 * 1.05
     assert ptp > 20.0
 
     sugar_os = GetDihedClasses(idxs=[0, 1, 2, 3])[1][0]

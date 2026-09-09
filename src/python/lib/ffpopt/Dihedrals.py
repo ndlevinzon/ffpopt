@@ -1462,6 +1462,14 @@ def DihedFitObjFcn(x,self):
             hlene -= np.amin(hlene)
             llene -= np.amin(llene)
 
+            # Per-COBYLA-step dumps (mfit.itXX.*.NNNN.dat). Off by default:
+            # nlmaxiter=300 × bonds × fragments floods fragment libraries.
+            # Re-enable with FFPOPT_WRITE_MFIT=1 for ffpopt-DihedTwistAnimate --source mfit.
+            write_mfit = os.environ.get("FFPOPT_WRITE_MFIT", "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+            if not write_mfit:
+                continue
             if prof.name is None or prof.plots is None:
                 continue
             elif len(prof.plots) == 0:

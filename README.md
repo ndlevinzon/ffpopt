@@ -665,7 +665,8 @@ to preduct partial charges.
    Builds animated convergence plots for twist workflow iterations.
    Default behavior uses scan outputs (`<prefix>_<i-j-k-l>.dat`)
    and compares `orig`/`itXX` scans against the high-level reference.
-   You can also use `--source mfit` to animate from `mfit.*.dat`.
+   You can also use `--source mfit` to animate from `mfit.*.dat`
+   (written only when `FFPOPT_WRITE_MFIT=1`).
 
 -   --input-dir: str
         Directory containing scan and/or mfit `.dat` files.

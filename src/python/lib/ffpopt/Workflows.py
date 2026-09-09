@@ -463,6 +463,25 @@ def _run_gendihedfit(citname: str, nlmaxiter: int, skip_existing: bool) -> None:
     )
 
 
+def _comparison_verdict(result) -> str:
+    if getattr(result, "is_flat", False):
+        return "FLAT"
+    if getattr(result, "is_close", False):
+        return "OK"
+    return "FAIL"
+
+
+def _print_scan_comparison(hl_prefix: str, ll_tag: str, idx: str, result) -> None:
+    """ One-line HL-vs-LL verdict (total energy), plus reasons if it failed. """
+    verdict = _comparison_verdict(result)
+    print(
+        f"[twist] {hl_prefix} vs {ll_tag} {idx}: {verdict}  "
+        f"barrier HL={result.barrier_hl:.2f} LL={result.barrier_ll:.2f} kcal/mol"
+    )
+    if result.reasons:
+        print(f"[twist]   {'; '.join(result.reasons)}")
+
+
 def _compare_per_bond(
     scans,
     hl_prefix: str,
@@ -470,15 +489,17 @@ def _compare_per_bond(
     config,
     plot_dir=None,
     structure_images=None,
+    parm_path=None,
+    plot_ll_tag=None,
 ):
     """ Run :func:`ffpopt.ScanAnalysis.compare_scan_files` for each scan.
 
     Compares ``{hl_prefix}_{idxs}.dat`` against ``{ll_prefix}_{idxs}.dat``
-    bond-by-bond. When ``plot_dir`` is set, also writes a
-    ``compare_{hl_prefix}_vs_{ll_prefix}_{idxs}.png`` plot per bond into
-    that directory (extrema, unmatched-extrema highlights, failed
-    criteria). When ``structure_images`` is set, the matching 2D drawing
-    is rendered as a top panel on each plot.
+    bond-by-bond (total potential energy). When ``plot_dir`` is set, writes
+    ``compare_{hl_prefix}_vs_{tag}_{idxs}.png`` (total energy) and, when
+    ``parm_path`` is set, ``compare_{hl_prefix}_vs_{tag}_{idxs}_dihed.png``
+    (isolated Fourier DIHE vs QM leftover). ``tag`` is ``plot_ll_tag`` or
+    ``ll_prefix``.
 
     Parameters
     ----------
@@ -487,7 +508,8 @@ def _compare_per_bond(
     hl_prefix : str
         High-level filename prefix (e.g. ``"qdpi2"``).
     ll_prefix : str
-        Low-level filename prefix (e.g. ``"orig"`` or ``"it01"``).
+        Low-level filename prefix (e.g. ``"orig"`` or ``"it01"``). Used to
+        locate ``.dat`` files.
     config : ffpopt.ScanAnalysis.ScanCompareConfig or None
         Tunable thresholds; forwarded to ``compare_scan_files``. ``None``
         uses the default thresholds.
@@ -496,6 +518,12 @@ def _compare_per_bond(
     structure_images : dict, optional
         Map from ``frozenset({a, b})`` (0-based central-bond atom indices)
         to a 2D structure image path. Default is None (no structure panel).
+    parm_path : str or pathlib.Path, optional
+        Amber parm7 for the LL side (``origparm`` or ``itNN.parm7``).
+        Needed for the isolated-dihedral PNG.
+    plot_ll_tag : str, optional
+        Filename tag for the PNG (e.g. ``"final"``). Default is
+        ``ll_prefix``. Does not change which ``.dat`` files are loaded.
 
     Returns
     -------
@@ -505,25 +533,75 @@ def _compare_per_bond(
     """
     from .ScanAnalysis import compare_scan_files
 
+    tag = plot_ll_tag if plot_ll_tag is not None else ll_prefix
     out = {}
     for scan in scans:
         idx = scan.GetIdxStr()
         hl_path = f"{hl_prefix}_{idx}.dat"
         ll_path = f"{ll_prefix}_{idx}.dat"
         plot_path = None
+        dihed_plot_path = None
         if plot_dir is not None:
-            plot_path = Path(plot_dir) / f"compare_{hl_prefix}_vs_{ll_prefix}_{idx}.png"
+            plot_path = Path(plot_dir) / f"compare_{hl_prefix}_vs_{tag}_{idx}.png"
+            if parm_path is not None:
+                dihed_plot_path = (
+                    Path(plot_dir) / f"compare_{hl_prefix}_vs_{tag}_{idx}_dihed.png"
+                )
         structure_image_path = None
         if structure_images is not None:
             structure_image_path = structure_images.get(
                 frozenset((scan.idxs[1], scan.idxs[2]))
             )
         out[idx] = compare_scan_files(
-            hl_path, ll_path, config,
+            hl_path,
+            ll_path,
+            config,
             plot_path=plot_path,
+            plot_title=f"{hl_prefix} vs {tag}",
             structure_image_path=structure_image_path,
+            parm_path=parm_path,
+            dihed_idxs=scan.idxs,
+            dihed_plot_path=dihed_plot_path,
+            hl_label=hl_prefix,
+            ll_label=tag,
         )
+        _print_scan_comparison(hl_prefix, tag, idx, out[idx])
     return out
+
+
+def _emit_final_comparisons(
+    *,
+    all_scans,
+    final_ll: dict,
+    hlname: str,
+    origparm,
+    compare_config,
+    plot_dir,
+    structure_images,
+    results: dict,
+) -> None:
+    """ Re-print and re-plot every bond against its last LL scan as ``final``. """
+    print("[twist] ===== final (post-fit) vs HL =====")
+    groups: dict[tuple, list] = {}
+    for scan in all_scans:
+        idx = scan.GetIdxStr()
+        ll = final_ll.get(idx, "orig")
+        parm = origparm if ll == "orig" else f"{ll}.parm7"
+        groups.setdefault((ll, str(parm)), []).append(scan)
+    final_comparisons = {}
+    for (ll, parm), group in groups.items():
+        chunk = _compare_per_bond(
+            group,
+            hlname,
+            ll,
+            compare_config,
+            plot_dir=plot_dir,
+            structure_images=structure_images,
+            parm_path=parm,
+            plot_ll_tag="final",
+        )
+        final_comparisons.update(chunk)
+    results["final_comparisons"] = final_comparisons
 
 
 def _apply_fit_and_prepare(
@@ -671,10 +749,11 @@ def run_dihed_twist_workflow(
         with HL in the same iteration. ``"off"``: skip the per-iteration
         comparison entirely. Default is "drop".
     plot_comparisons : bool, optional
-        If True, save a PNG plot per bond per comparison alongside the
-        ``.dat`` files (filenames like
-        ``compare_{hl}_vs_{ll}_{idxs}.png``). Useful for eyeballing why a
-        dihedral was kept or dropped. Default is False.
+        If True, save PNGs per bond per comparison alongside the ``.dat``
+        files: ``compare_{hl}_vs_{ll}_{idxs}.png`` (total energy) and
+        ``compare_{hl}_vs_{ll}_{idxs}_dihed.png`` (isolated Fourier DIHE).
+        After fitting, the same pair is also written with ``ll=final``.
+        Default is False.
     structure_images : dict, optional
         Map of ``frozenset({a, b})`` (0-based central-bond atom indices)
         to a 2D structure image path (PNG or SVG). When provided alongside
@@ -698,7 +777,8 @@ def run_dihed_twist_workflow(
         bond-idx string to :class:`~ffpopt.ScanAnalysis.ScanComparison` from
         Phase 2b), ``iteration_comparisons`` (per-iteration map), and
         ``early_stopped_at`` (the ``citname`` at which the loop broke, or
-        ``None`` if it ran to ``maxiter``).
+        ``None`` if it ran to ``maxiter``), and ``final_comparisons`` (last
+        HL-vs-LL total-energy verdict per bond after fitting).
     """
     # ---- 0. Resolve & validate kwargs ------------------------------------
     valid_modes = {"drop", "all_or_nothing", "off"}
@@ -776,7 +856,11 @@ def run_dihed_twist_workflow(
         "initial_comparisons": {},
         "iteration_comparisons": [],
         "early_stopped_at": None,
+        "final_comparisons": {},
     }
+
+    all_scans = list(scans)
+    final_ll = {s.GetIdxStr(): "orig" for s in all_scans}
 
     # ---- 1-2. High-level + reference sander scans (one pooled queue) -----
     hl_orig_jobs = _bond_jobs_for_scans(
@@ -806,6 +890,7 @@ def run_dihed_twist_workflow(
         initial = _compare_per_bond(
             scans, hlname, "orig", compare_config,
             plot_dir=plot_dir, structure_images=structure_images,
+            parm_path=origparm,
         )
         results["initial_comparisons"] = initial
         kept_bonds = []
@@ -822,6 +907,16 @@ def run_dihed_twist_workflow(
                 print(f"[twist] {idx}: refit needed ({reasons})")
         if not kept_bonds:
             print("[twist] all dihedrals already agree — skipping Phase 3")
+            _emit_final_comparisons(
+                all_scans=all_scans,
+                final_ll=final_ll,
+                hlname=hlname,
+                origparm=origparm,
+                compare_config=compare_config,
+                plot_dir=plot_dir,
+                structure_images=structure_images,
+                results=results,
+            )
             from . NondaemonPool import close_reused_wavefront_pool
             close_reused_wavefront_pool()
             return results
@@ -879,12 +974,15 @@ def run_dihed_twist_workflow(
         )
         for item in _execute_bond_scan_jobs(it_jobs, nproc):
             results["scans"].append((citname, item["dihed_idxs"], item["result"]))
+        for scan in scans:
+            final_ll[scan.GetIdxStr()] = citname
 
         # 3e. Per-iteration convergence: compare HL vs itNN per bond.
         if convergence_mode != "off":
             iter_cmp = _compare_per_bond(
                 scans, hlname, citname, compare_config,
                 plot_dir=plot_dir, structure_images=structure_images,
+                parm_path=f"{citname}.parm7",
             )
             results["iteration_comparisons"].append(
                 {"citname": citname, "comparisons": iter_cmp}
@@ -926,6 +1024,16 @@ def run_dihed_twist_workflow(
                     f"still need refit: {', '.join(still_off_idxs)}"
                 )
 
+    _emit_final_comparisons(
+        all_scans=all_scans,
+        final_ll=final_ll,
+        hlname=hlname,
+        origparm=origparm,
+        compare_config=compare_config,
+        plot_dir=plot_dir,
+        structure_images=structure_images,
+        results=results,
+    )
     from . NondaemonPool import close_reused_wavefront_pool
     close_reused_wavefront_pool()
     return results

@@ -463,6 +463,84 @@ def _load_any(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     raise ValueError(f"unsupported scan file extension: {p.suffix} ({p})")
 
 
+def mm_dihedral_energy_from_parm(
+    parm_path: str | Path,
+    idxs: Sequence[int],
+    angles: Sequence[float],
+) -> np.ndarray:
+    """ Amber Fourier DIHE energy (kcal/mol) for one quartet vs angle.
+
+    This is the cosine series on the scanned 4-atom dihedral, not 1-4
+    elec/vdw and not the rest of the MM potential.
+    """
+    from .Dihedrals import GetMultiDihedFcnFromIdxs
+
+    try:
+        import parmed
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("mm_dihedral_energy_from_parm requires parmed") from exc
+
+    parm = parmed.load_file(str(parm_path))
+    fcn = GetMultiDihedFcnFromIdxs(parm, list(idxs))
+    return np.array([float(fcn.CptEne(float(ang))) for ang in angles], dtype=float)
+
+
+def isolate_dihedral_profiles(
+    hl_angles: Sequence[float],
+    hl_energies: Sequence[float],
+    ll_angles: Sequence[float],
+    ll_energies: Sequence[float],
+    mm_dihed_energy,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """ Isolate the scanned dihedral term from two total-energy profiles.
+
+    On a common angle grid::
+
+        V_target(φ) = E_HL(φ) - E_MM(φ) + V_MM(φ)
+                    = E_HL(φ) - E_MM_without_this_DIHE(φ)
+
+    ``V_MM`` is the Amber Fourier series for the quartet. ``V_target`` is
+    what that series is supposed to match (QM leftover after other MM
+    terms). A constant offset from independently min-shifted scan files
+    is harmless: callers min-shift again for plotting / comparison.
+
+    Parameters
+    ----------
+    mm_dihed_energy
+        Callable ``angle_deg -> kcal/mol``, or an array already aligned
+        with the common (finer) grid.
+
+    Returns
+    -------
+    angles, v_target, v_mm
+        Common angles (degrees) and the two dihedral profiles (kcal/mol).
+    """
+    a_hl, e_hl = _to_sorted_arrays(hl_angles, hl_energies)
+    a_ll, e_ll = _to_sorted_arrays(ll_angles, ll_energies)
+    if a_hl.size >= a_ll.size:
+        angles = a_hl
+        e_hl_c = e_hl
+        same = a_hl.shape == a_ll.shape and np.allclose(a_hl, a_ll)
+        e_ll_c = e_ll if same else _interpolate_to(a_hl, a_ll, e_ll)
+    else:
+        angles = a_ll
+        e_ll_c = e_ll
+        e_hl_c = _interpolate_to(a_ll, a_hl, e_hl)
+
+    if callable(mm_dihed_energy):
+        v_mm = np.array(
+            [float(mm_dihed_energy(float(ang))) for ang in angles], dtype=float
+        )
+    else:
+        v_mm = np.asarray(mm_dihed_energy, dtype=float).ravel()
+        if v_mm.shape != angles.shape:
+            raise ValueError(
+                f"mm_dihed_energy shape {v_mm.shape} != angles {angles.shape}"
+            )
+    v_target = e_hl_c - e_ll_c + v_mm
+    return angles, v_target, v_mm
+
+
 def compare_scan_files(
     hl_path: str | Path,
     ll_path: str | Path,
@@ -471,14 +549,24 @@ def compare_scan_files(
     plot_path: str | Path | None = None,
     plot_title: str | None = None,
     structure_image_path: str | Path | None = None,
+    parm_path: str | Path | None = None,
+    dihed_idxs: Sequence[int] | None = None,
+    dihed_plot_path: str | Path | None = None,
+    hl_label: str | None = None,
+    ll_label: str | None = None,
 ) -> ScanComparison:
     """ Load two scan files and compare via :func:`compare_scans`.
 
     Each path may be a ``.dat`` (wavefront's companion file) or a ``.json``
     (``ListOfStruct`` with per-conformer dihedral constraints + energies).
+    The energies in those files are **total** potential energy (HL
+    calculator vs sander MM), min-shifted for the comparison.
+
     When ``plot_path`` is given, also calls :func:`plot_comparison` to save
     a PNG with extrema highlighted, the matched-pair connections, and the
-    list of failed criteria.
+    list of failed criteria. When ``dihed_plot_path``, ``parm_path``, and
+    ``dihed_idxs`` are given, a second PNG isolates the Fourier DIHE term
+    against the QM leftover ``E_HL - E_MM + V_MM``.
 
     Parameters
     ----------
@@ -498,15 +586,27 @@ def compare_scan_files(
     structure_image_path : str or pathlib.Path, optional
         2D fragment-structure image (PNG/JPG or SVG) to render as a top
         panel on the plot. Default is None (no structure panel).
+    parm_path : str or pathlib.Path, optional
+        Amber parm7 used to evaluate the MM Fourier DIHE for
+        ``dihed_plot_path``.
+    dihed_idxs : sequence of int, optional
+        0-based 4-atom indices of the scanned proper dihedral.
+    dihed_plot_path : str or pathlib.Path, optional
+        Output PNG for the isolated dihedral-term comparison.
+    hl_label, ll_label : str, optional
+        Legend labels on the total-energy plot. Default: file stems.
 
     Returns
     -------
     ScanComparison
         Structured verdict and diagnostic detail (see :func:`compare_scans`).
+        The drop/keep heuristic always uses **total** energy.
     """
     a_hl, e_hl = _load_any(hl_path)
     a_ll, e_ll = _load_any(ll_path)
     result = compare_scans(a_hl, e_hl, a_ll, e_ll, config=config)
+    hl_leg = hl_label if hl_label is not None else Path(hl_path).stem
+    ll_leg = ll_label if ll_label is not None else Path(ll_path).stem
     if plot_path is not None:
         plot_comparison(
             a_hl,
@@ -516,11 +616,47 @@ def compare_scan_files(
             result,
             out_path=plot_path,
             title=plot_title,
-            hl_label=Path(hl_path).stem,
-            ll_label=Path(ll_path).stem,
+            hl_label=hl_leg,
+            ll_label=ll_leg,
             config=config,
             structure_image_path=structure_image_path,
+            ylabel="Total energy (kcal/mol, min-shifted)",
         )
+    if (
+        dihed_plot_path is not None
+        and parm_path is not None
+        and dihed_idxs is not None
+    ):
+        try:
+            from .Dihedrals import GetMultiDihedFcnFromIdxs
+            import parmed
+
+            parm = parmed.load_file(str(parm_path))
+            fcn = GetMultiDihedFcnFromIdxs(parm, list(dihed_idxs))
+            angles, v_target, v_mm = isolate_dihedral_profiles(
+                a_hl, e_hl, a_ll, e_ll, fcn.CptEne
+            )
+            dihed_cmp = compare_scans(angles, v_target, angles, v_mm, config=config)
+            plot_comparison(
+                angles,
+                v_target,
+                angles,
+                v_mm,
+                dihed_cmp,
+                out_path=dihed_plot_path,
+                title=(
+                    (plot_title + "  [DIHE]")
+                    if plot_title
+                    else f"{hl_leg} vs {ll_leg}  [DIHE]"
+                ),
+                hl_label="HL - MM_other",
+                ll_label="MM DIHE",
+                config=config,
+                structure_image_path=structure_image_path,
+                ylabel="Dihedral term (kcal/mol, min-shifted)",
+            )
+        except Exception as exc:
+            print(f"[plot] skip dihedral-term plot ({dihed_plot_path}): {exc}")
     return result
 
 
@@ -598,6 +734,7 @@ def plot_comparison(
     ll_label: str = "LL",
     config: ScanCompareConfig | None = None,
     structure_image_path: str | Path | None = None,
+    ylabel: str = "Total energy (kcal/mol, min-shifted)",
 ) -> Path:
     """ Save a comparison plot for two dihedral scan profiles.
 
@@ -643,6 +780,8 @@ def plot_comparison(
     structure_image_path : str or pathlib.Path, optional
         2D fragment-structure image (PNG/JPG or SVG) to render as a top
         panel. Default is None (no structure panel).
+    ylabel : str, optional
+        Y-axis label. Default is total (min-shifted) potential energy.
 
     Returns
     -------
@@ -744,7 +883,7 @@ def plot_comparison(
         y=0.995,
     )
     ax.set_xlabel("Dihedral angle (°)")
-    ax.set_ylabel("Energy (kcal/mol, min-shifted)")
+    ax.set_ylabel(ylabel)
     ax.set_xlim(0.0, 360.0)
     ax.grid(alpha=0.3)
     ax.legend(loc="upper right")

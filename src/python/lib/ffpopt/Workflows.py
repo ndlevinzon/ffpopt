@@ -471,6 +471,14 @@ def _comparison_verdict(result) -> str:
     return "FAIL"
 
 
+def _barrier_err(result) -> float:
+    return abs(float(result.barrier_hl) - float(result.barrier_ll))
+
+
+def _sum_barrier_err(comparisons) -> float:
+    return float(sum(_barrier_err(r) for r in comparisons.values()))
+
+
 def _print_scan_comparison(hl_prefix: str, ll_tag: str, idx: str, result) -> None:
     """ One-line HL-vs-LL verdict (total energy), plus reasons if it failed. """
     verdict = _comparison_verdict(result)
@@ -884,6 +892,11 @@ def run_dihed_twist_workflow(
         results["scans"].append((item["prefix"], item["dihed_idxs"], item["result"]))
 
     plot_dir = Path(".") if plot_comparisons else None
+    from .ScanAnalysis import ScanCompareConfig
+
+    cmp_cfg = compare_config if compare_config is not None else ScanCompareConfig()
+    prev_barrier_score = None
+    prev_ll_tag = "orig"
 
     # ---- 2b. Drop dihedrals that already agree (initial convergence) -----
     if skip_converged_initial:
@@ -894,6 +907,7 @@ def run_dihed_twist_workflow(
         )
         results["initial_comparisons"] = initial
         kept_bonds = []
+        require_barrier = bool(getattr(cmp_cfg, "refit_requires_barrier_fail", True))
         for scan in scans:
             idx = scan.GetIdxStr()
             r = initial[idx]
@@ -901,6 +915,12 @@ def run_dihed_twist_workflow(
                 reason = "flat (HL barrier below threshold)" if r.is_flat \
                     else "agrees with HL within thresholds"
                 print(f"[twist] {idx}: {reason} — dropping from iterative fit")
+            elif require_barrier and _barrier_err(r) <= cmp_cfg.barrier_tol:
+                print(
+                    f"[twist] {idx}: barrier within tol "
+                    f"(HL={r.barrier_hl:.2f} LL={r.barrier_ll:.2f} kcal/mol) "
+                    "— not refitting (shape mismatch is left as-is)"
+                )
             else:
                 kept_bonds.append([scan.idxs[1], scan.idxs[2]])
                 reasons = "; ".join(r.reasons) if r.reasons else "extrema disagree"
@@ -929,6 +949,13 @@ def run_dihed_twist_workflow(
                 scans_per_type=scans_per_type,
             )
             print(f"[twist] fitting {len(scans)} of {len(bonds_parsed)} dihedrals")
+        prev_barrier_score = _sum_barrier_err(
+            {
+                s.GetIdxStr(): initial[s.GetIdxStr()]
+                for s in scans
+                if s.GetIdxStr() in initial
+            }
+        )
 
     # ---- 3. Iterative refinement -----------------------------------------
     for it in range(args.maxiter):
@@ -974,8 +1001,11 @@ def run_dihed_twist_workflow(
         )
         for item in _execute_bond_scan_jobs(it_jobs, nproc):
             results["scans"].append((citname, item["dihed_idxs"], item["result"]))
-        for scan in scans:
-            final_ll[scan.GetIdxStr()] = citname
+
+        if convergence_mode == "off":
+            for scan in scans:
+                final_ll[scan.GetIdxStr()] = citname
+            continue
 
         # 3e. Per-iteration convergence: compare HL vs itNN per bond.
         if convergence_mode != "off":
@@ -987,6 +1017,23 @@ def run_dihed_twist_workflow(
             results["iteration_comparisons"].append(
                 {"citname": citname, "comparisons": iter_cmp}
             )
+            new_score = _sum_barrier_err(iter_cmp)
+            if (
+                prev_barrier_score is not None
+                and new_score > prev_barrier_score + 0.05
+            ):
+                print(
+                    f"[twist] {citname}: rejected "
+                    f"(sum |Δbarrier| {new_score:.2f} > {prev_barrier_score:.2f} "
+                    f"kcal/mol); keeping {prev_ll_tag}"
+                )
+                results.setdefault("rejected_iterations", []).append(citname)
+                results["early_stopped_at"] = prev_ll_tag
+                break
+            for scan in scans:
+                final_ll[scan.GetIdxStr()] = citname
+            prev_barrier_score = new_score
+            prev_ll_tag = citname
             converged_idxs = [idx for idx, r in iter_cmp.items() if r.is_close]
             still_off_idxs = [idx for idx, r in iter_cmp.items() if not r.is_close]
 

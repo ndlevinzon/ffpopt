@@ -221,3 +221,15 @@ def test_sp3_rotor_policy_zero_and_alkane_cap():
         out, action, _ptp = apply_sp3_rotor_policy(amide, "o-c-ns-c3", where="test")
     assert action == "keep"
     assert float(out.prims[0].fc) == pytest.approx(15.0)
+
+
+def test_scale_fcs_to_leftover_ptp():
+    dense_torsion_ptp = reg.dense_torsion_ptp
+    scale_fcs_to_ptp = reg.scale_fcs_to_ptp
+    GetDihedClasses = dihed.GetDihedClasses
+
+    dfcn = GetDihedClasses(idxs=[0, 1, 2, 3])[1][0]
+    dfcn.SetFCs([20.0])
+    assert dense_torsion_ptp(dfcn) > 30.0
+    scale_fcs_to_ptp(dfcn, 5.0)
+    assert dense_torsion_ptp(dfcn) == pytest.approx(5.0, rel=0.02)

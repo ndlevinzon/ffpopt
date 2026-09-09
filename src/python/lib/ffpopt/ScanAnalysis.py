@@ -50,6 +50,11 @@ class ScanCompareConfig:
         If HL and LL are sampled on different angle deltas, linearly
         interpolate the coarser profile onto the finer grid before extrema
         detection. If False, raise on mismatched grids. Default is True.
+    refit_requires_barrier_fail : bool, optional
+        If True, a bond whose overall barrier already matches within
+        ``barrier_tol`` is not sent to Fourier refit even when the shape /
+        extrema tests fail. Fitting those extra wiggles is what inflated
+        CHAPS 0-1-2-3 from 11 to 25–80 kcal/mol. Default is True.
     """
 
     angle_tol: float = 15.0
@@ -60,6 +65,7 @@ class ScanCompareConfig:
     prominence: float = 0.3
     require_same_count: bool = True
     interpolate_to_finer_grid: bool = True
+    refit_requires_barrier_fail: bool = True
 
 
 @dataclass

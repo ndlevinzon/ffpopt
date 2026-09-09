@@ -101,12 +101,18 @@ def dense_torsion_ptp(dfcn, n: int = 361) -> float:
     return float(np.max(v) - np.min(v))
 
 
-def _scale_fcs_to_ptp(dfcn, target: float) -> None:
+def scale_fcs_to_ptp(dfcn, target: float) -> None:
+    """Uniformly scale PKs so ``V(φ)`` peak-to-peak equals ``target``."""
+
     ptp = dense_torsion_ptp(dfcn)
     if ptp <= 1.0e-12 or target <= 0:
         return
     scale = float(target) / ptp
     dfcn.SetFCs([float(p.fc) * scale for p in dfcn.prims])
+
+
+def _scale_fcs_to_ptp(dfcn, target: float) -> None:
+    scale_fcs_to_ptp(dfcn, target)
 
 
 def solve_regularized_fcs(

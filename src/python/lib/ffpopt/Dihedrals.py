@@ -637,6 +637,7 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
         fit_fourier_nprim,
         nprim_select_enabled,
         phase_variant_functions,
+        scale_fcs_to_ptp,
         solve_regularized_fcs,
     )
 
@@ -694,6 +695,23 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
     if bestdfcn is None:
         raise RuntimeError(f"IsolatedLinearSolve failed for {pname}")
     bestdfcn = _pad_to_nprim(bestdfcn)
+    y_ptp = float(np.max(y) - np.min(y))
+    leftover_slack = 1.15
+    try:
+        leftover_slack = float(
+            __import__("os").environ.get("FFPOPT_DIHED_LEFTOVER_SLACK", "1.15")
+        )
+    except (TypeError, ValueError):
+        leftover_slack = 1.15
+    leftover_cap = max(y_ptp * leftover_slack, 0.5)
+    ptp_before = dense_torsion_ptp(bestdfcn)
+    if ptp_before > leftover_cap:
+        scale_fcs_to_ptp(bestdfcn, leftover_cap)
+        print(
+            f"[fit] leftover-ptp cap at {pname}: V {ptp_before:.2f} -> "
+            f"{dense_torsion_ptp(bestdfcn):.2f} kcal/mol "
+            f"(leftover ptp={y_ptp:.2f})"
+        )
     apply_chemical_rotor_policy(bestdfcn, pname, where=pname)
     print(
         f"[fit] {pname}: PKs={[round(p.fc, 4) for p in bestdfcn.prims]} "
@@ -1535,7 +1553,24 @@ def NonlinearSolve(args,finp):
     n = finp.get_num_params()
     x = finp.make_initial_guesses()
     cap = dihed_fc_abs_max()
-    x = clip_dihed_fcs(x, where="nonlinear-x0")
+    x = clip_dihed_fcs(x, where="linear-x0")
+    finp.set_params(x)
+
+    # Inner COBYLA+GeomOpt matches *relaxed total* MM energy and can walk
+    # PKs up to the clip even when leftover is small (11 → 25 → 35 kcal).
+    # The outer twist loop already rescans; default is the isolated linear fit.
+    import os as _os
+
+    relax = str(_os.environ.get("FFPOPT_FIT_RELAX", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if not relax:
+        print(
+            "[fit] regularized linear FCs only "
+            "(set FFPOPT_FIT_RELAX=1 for COBYLA + per-step GeomOpt)"
+        )
+        return
+
     bounds = [(-cap, cap) for _ in range(n)]
 
     for s in finp.systems:

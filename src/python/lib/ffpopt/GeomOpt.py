@@ -182,7 +182,12 @@ def _run_geometric_with_watchdog(cmds, tmplog,
     import time
 
     child_env = os.environ.copy()
-    #child_env["PYTHONWARNINGS"] = "ignore:ignore_bad_restart_file:FutureWarning"
+    extra = "ignore:.*ignore_bad_restart_file:FutureWarning"
+    existing = child_env.get("PYTHONWARNINGS", "")
+    if "ignore_bad_restart_file" not in existing:
+        child_env["PYTHONWARNINGS"] = (
+            f"{existing},{extra}" if existing else extra
+        )
 
 
     

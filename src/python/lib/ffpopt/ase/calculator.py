@@ -38,6 +38,33 @@ for key in ["OMP_NUM_THREADS","DP_INTRA_OP_PARALLELISM_THREADS","DP_INTER_OP_PAR
 
 from ase.calculators.calculator import Calculator, all_changes
 from collections import defaultdict as ddict
+import warnings
+
+
+def _install_ase_futurewarning_filter() -> None:
+    """Silence ASE ``ignore_bad_restart_file`` (SANDER / TBLite / MOPAC).
+
+    Those calculators still construct ``Calculator`` with the deprecated
+    keyword or extra positional args. Filter here so spawn workers that
+    import this module never print the FutureWarning on stderr.
+    """
+    if getattr(_install_ase_futurewarning_filter, "_done", False):
+        return
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=r".*ignore_bad_restart_file.*",
+    )
+    extra = "ignore:.*ignore_bad_restart_file:FutureWarning"
+    existing = os.environ.get("PYTHONWARNINGS", "")
+    if "ignore_bad_restart_file" not in existing:
+        os.environ["PYTHONWARNINGS"] = (
+            f"{existing},{extra}" if existing else extra
+        )
+    _install_ase_futurewarning_filter._done = True  # type: ignore[attr-defined]
+
+
+_install_ase_futurewarning_filter()
 
 def CopyParm( parm ):
     import copy

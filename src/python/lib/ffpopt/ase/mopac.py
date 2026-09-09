@@ -102,9 +102,12 @@ class MOPAC(FileIOCalculator):
         """
         if label is None:
             label = generate_temp_filename()
-        
-        FileIOCalculator.__init__(self, restart, ignore_bad_restart_file,
-                                  label, atoms, **kwargs)
+        # Do not forward ignore_bad_restart_file: ASE warns on that keyword
+        # and on extra positional Calculator arguments.
+        _ = ignore_bad_restart_file
+        FileIOCalculator.__init__(
+            self, restart=restart, label=label, atoms=atoms, **kwargs
+        )
 
         
         

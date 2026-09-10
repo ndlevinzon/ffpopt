@@ -737,6 +737,7 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname, instance_idxs=None):
         format_prims,
         fourier_rss,
         phase_variant_functions,
+        scale_fcs_to_ptp,
         _solve_leftover_linear,
     )
     import os as _os
@@ -829,6 +830,14 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname, instance_idxs=None):
         f"caps leftover={leftover_cap:.2f} chemical={chem_cap:.2f}"
     )
     cap_effective_ptp(bestdfcn, instance_angs, target, where=pname)
+    q_ptp = dense_torsion_ptp(bestdfcn)
+    if q_ptp > chem_cap:
+        print(
+            f"[fit] one-quartet ptp {q_ptp:.2f} > chemical cap {chem_cap:.2f} "
+            f"at {pname} (cancelled harmonics leaked into a single oxygen). "
+            "Scaling the written Fourier."
+        )
+        scale_fcs_to_ptp(bestdfcn, chem_cap)
 
     rss_fit, const_fit, v_fit, r2_fit = fourier_rss(
         angs, y, bestdfcn, instance_angs=instance_angs

@@ -353,3 +353,34 @@ def test_instance_sum_prefers_n3_for_c3_rotor():
     rss, _c, _vv, r2 = reg.fourier_rss(phi, y, dfcn, instance_angs=inst)
     assert r2 > 0.95
     assert abs(pks[0]) < abs(by_per[3]) + 0.05
+
+
+def test_c3_null_columns_are_dropped():
+    surviving_periods = reg.surviving_periods
+    fit_leftover_fourier = reg.fit_leftover_fourier
+
+    phi = np.linspace(0.0, 350.0, 36)
+    inst = np.column_stack([phi, phi + 120.0, phi + 240.0])
+    kept, norms = surviving_periods(phi, 3, instance_angs=inst)
+    assert kept == [3]
+    assert norms[1] < 0.05 * norms[3]
+    assert norms[2] < 0.05 * norms[3]
+
+    rng = np.random.default_rng(1)
+    y = 4.0 * np.sin(np.deg2rad(phi)) + 0.05 * rng.normal(size=phi.size)
+    with patch.dict(
+        os.environ,
+        {
+            "FFPOPT_DIHED_NPRIM_SELECT": "1",
+            "FFPOPT_DIHED_IRLS": "0",
+            "FFPOPT_DIHED_RIDGE_LAMBDA": "0",
+            "FFPOPT_DIHED_COL_REL": "0.05",
+        },
+        clear=False,
+    ):
+        dfcn, _x, info = fit_leftover_fourier(
+            phi, y, 3, [0, 1, 2, 3], pname="test-null", instance_angs=inst
+        )
+    assert info.get("dropped_periods") == [1, 2]
+    assert all(int(p.per) == 3 for p in dfcn.prims)
+    assert max(abs(float(p.fc)) for p in dfcn.prims) < 8.0

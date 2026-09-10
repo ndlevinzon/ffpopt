@@ -382,6 +382,41 @@ def cap_effective_ptp(dfcn, instance_angs, target: float, *, where: str = "") ->
     return new_ptp
 
 
+def column_rel_cutoff() -> float:
+    """Drop instance-sum harmonics weaker than this fraction of the strongest."""
+
+    return _envf("FFPOPT_DIHED_COL_REL", 0.05)
+
+
+def surviving_periods(angs, nprim_max: int, instance_angs=None, rel: float | None = None):
+    """Periods whose instance-sum cosine column is not numerically cancelled.
+
+    For a C3 rotor, ``||Σ_j cos(φ_j)||`` and ``||Σ_j cos(2φ_j)||`` are ~0
+    while ``||Σ_j cos(3φ_j)||`` is O(√N). Fitting the cancelled columns
+    inverts noise into PK ~ 250, which then clips to ±25 and dominates
+    the one-quartet plot without moving the scan barrier.
+    """
+
+    nprim_max = max(1, int(nprim_max))
+    periods = list(range(1, nprim_max + 1))
+    A = design_cosine_matrix(angs, periods, instance_angs=instance_angs)
+    norms = np.array(
+        [float(np.linalg.norm(A[:, i])) for i in range(len(periods))],
+        dtype=float,
+    )
+    if rel is None:
+        rel = column_rel_cutoff()
+    smax = float(np.max(norms)) if norms.size else 0.0
+    kept = [
+        int(p)
+        for p, n in zip(periods, norms)
+        if smax > 0.0 and float(n) >= float(rel) * smax
+    ]
+    if not kept and periods:
+        kept = [int(periods[int(np.argmax(norms))])]
+    return kept, {int(p): float(n) for p, n in zip(periods, norms)}
+
+
 def chemical_barrier_cap(type_key: str) -> float:
     """Peak-to-peak cap (kcal/mol) for the instance-sum torsion on a bond."""
 
@@ -530,51 +565,59 @@ def fit_leftover_fourier(
 
     Signed PK at phase 0° is equivalent (up to a constant) to a 180°
     term, so the old ``2^nprim`` phase enumeration is unnecessary.
-    ``instance_angs`` sums equivalent quartets so C3 rotors select n=3.
+    Only instance-sum columns that survive :func:`surviving_periods`
+    are fitted, so C3 rotors get n=3 rather than clipped ±25 on n=1,2.
     """
 
-    from .Dihedrals import GetDihedClasses
+    from .Dihedrals import MultiDihedFcn, PrimDihedFcn
 
     angs = np.asarray(angs, dtype=float).reshape(-1)
     y = np.asarray(y, dtype=float).reshape(-1)
     nprim_max = max(1, int(nprim_max))
-    orders = range(1, nprim_max + 1) if nprim_select_enabled() else (nprim_max,)
-    best = None
-    for nprim in orders:
-        dfcn = GetDihedClasses(idxs=list(idxs))[nprim][0]
-        A = design_cosine_matrix(
-            angs, [p.per for p in dfcn.prims], instance_angs=instance_angs
-        )
-        if pname and nprim == nprim_max:
-            coln = [
-                float(np.linalg.norm(A[:, i])) for i in range(len(dfcn.prims))
-            ]
+    kept, norms = surviving_periods(angs, nprim_max, instance_angs=instance_angs)
+    if pname:
+        bits = ", ".join(f"n={p} ||cos||={norms[p]:.3g}" for p in sorted(norms))
+        print(f"[fit] instance-sum column norms at {pname}: {bits}")
+        dropped = [p for p in sorted(norms) if p not in kept]
+        if dropped:
             print(
-                f"[fit] instance-sum column norms at {pname}: "
-                + ", ".join(
-                    f"n={p.per} ||cos||={n:.3g}"
-                    for p, n in zip(dfcn.prims, coln)
-                )
+                f"[fit] dropping cancelled periods {dropped} at {pname} "
+                f"(||cos|| < {column_rel_cutoff():.2g}× strongest {max(norms.values()):.3g})"
             )
+    if not kept:
+        kept = [1]
+    if nprim_select_enabled() and len(kept) > 1:
+        candidates = [kept[:i] for i in range(1, len(kept) + 1)]
+    else:
+        candidates = [kept]
+    best = None
+    for periods in candidates:
+        dfcn = MultiDihedFcn(
+            list(idxs), [PrimDihedFcn(1.0, 0.0, n) for n in periods]
+        )
+        A = design_cosine_matrix(angs, periods, instance_angs=instance_angs)
         x, info = _solve_leftover_linear(A, y)
         n_fc = len(dfcn.prims)
-        pks = clip_dihed_fcs(x[:n_fc], where=f"{pname}:n{nprim}" if pname else "")
+        tag = f"{pname}:n{','.join(str(p) for p in periods)}" if pname else ""
+        pks = clip_dihed_fcs(x[:n_fc], where=tag)
         dfcn.SetFCs(pks)
         rss, const, _v, r2 = fourier_rss(angs, y, dfcn, instance_angs=instance_angs)
-        aic = _aic(rss, y.size, nprim + 1)
-        rec = (aic, rss, nprim, dfcn, x, info, const, r2)
+        aic = _aic(rss, y.size, len(periods) + 1)
+        rec = (aic, rss, len(periods), dfcn, x, info, const, r2, tuple(periods))
         if best is None or aic < best[0]:
             best = rec
-    aic, rss, nprim, dfcn, x, info, const, r2 = best
+    aic, rss, nprim, dfcn, x, info, const, r2, periods = best
     info = dict(info)
     info["nprim"] = int(nprim)
+    info["periods"] = list(periods)
     info["aic"] = float(aic)
     info["rss"] = float(rss)
     info["r2"] = float(r2)
     info["const"] = float(const)
+    info["dropped_periods"] = [p for p in sorted(norms) if p not in kept]
     if pname:
         print(
-            f"[fit] leftover LS {pname}: nprim={nprim}/{nprim_max} "
+            f"[fit] leftover LS {pname}: periods={list(periods)} "
             f"rss={rss:.4g} r²={r2:.4f} aic={aic:.3f} "
             f"λ={info.get('lam', 0):.3g} cond={info.get('cond', float('nan')):.3g} "
             f"n_irls={info.get('n_irls', 0)} PKs={[round(p.fc, 4) for p in dfcn.prims]}"

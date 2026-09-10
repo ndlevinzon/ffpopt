@@ -596,7 +596,7 @@ def EnergyScansWithoutDihedrals(mol,list_of_los,cons):
 
 
 
-def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
+def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname, instance_idxs=None):
     """ Solve the isolated linear problem for dihedral parameters.
     
     Parameters
@@ -637,14 +637,27 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
         print(f"[fit] proper terms on central bond {idxs[1]}-{idxs[2]}:")
         for line in rotors:
             print(f"[fit] {line}")
+
+    inst = []
+    seen = set()
+    for q in list(instance_idxs or []) + [list(idxs)]:
+        q = tuple(int(i) for i in q)
+        key = q if q <= q[::-1] else q[::-1]
+        if key in seen:
+            continue
+        seen.add(key)
+        inst.append(list(q))
+    if not inst:
+        inst = [list(idxs)]
     print(
-        f"[fit] leftover MM: delete scanned quartet only, "
-        f"{len(losll)} geometries (sander, no GeomOpt)"
+        f"[fit] leftover MM: delete {len(inst)} type-equivalent quartet(s) "
+        f"{inst}  ({len(losll)} geometries, sander, no GeomOpt)"
     )
 
     graph = losll.structs[0].GetGraph()
     list_of_scans = [ losll ]
-    cons = [ Constraint("dihed",idxs,graph=graph) ]
+    scan_con = Constraint("dihed", idxs, graph=graph)
+    cons = [ Constraint("dihed", q, graph=graph) for q in inst ]
     list_of_enes = EnergyScansWithoutDihedrals(mol,list_of_scans,cons)
     llenes = np.array(list_of_enes[0])
     hlenes = np.array(hlenes,copy=True)
@@ -666,21 +679,30 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
     
 
     angs = []
+    inst_rows = []
     for igeom,llgeom in enumerate(losll):
         g = llgeom.GetASEAtoms()
-        o = FillConstraints(g,cons,force=True)
+        o = FillConstraints(g,[scan_con],force=True)
         v = o[0].value
         if abs(360-v) < 0.01:
             v=0
         angs.append(v)
+        row = []
+        for q in inst:
+            a = float(g.get_dihedral(*q))
+            if abs(a - 360) < 0.01:
+                a = 0.0
+            row.append(a)
+        inst_rows.append(row)
 
     data = []
     for i in range(len(losll)):
-        data.append( [angs[i],llenes[i],hlenes[i]] )
+        data.append( [angs[i],llenes[i],hlenes[i], inst_rows[i]] )
     data = sorted(data,key=lambda x: x[0])
     angs = np.array( [x[0] for x in data] )
     llenes = np.array( [x[1] for x in data] )
     hlenes = np.array( [x[2] for x in data] )
+    instance_angs = np.array( [x[3] for x in data], dtype=float )
     y = hlenes-llenes
     
     npts = len(y)
@@ -690,17 +712,31 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
         f"[fit] leftover y: n={npts} ptp={y_ptp:.3f} std={y_std:.3f} kcal/mol "
         f"φ=[{float(np.min(angs)):.1f}, {float(np.max(angs)):.1f}]°"
     )
+    offsets = []
+    for j in range(instance_angs.shape[1]):
+        d = (instance_angs[:, j] - angs + 180.0) % 360.0 - 180.0
+        offsets.append(float(np.mean(d)))
+    print(
+        f"[fit] {len(inst)} instance(s); mean φ offsets vs scan: "
+        + ", ".join(f"{o:.1f}°" for o in offsets)
+    )
+    if len(inst) >= 3:
+        print(
+            f"[fit] {pname}: equivalent rotors on one bond — n=1,2 often cancel "
+            "in the total energy; instance-sum LS should pick n=3 (or a multiple)"
+        )
 
     from .DihedFitRegularize import (
         append_fit_trace,
-        apply_chemical_rotor_policy,
+        cap_effective_ptp,
+        chemical_barrier_cap,
         clip_dihed_fcs,
         dense_torsion_ptp,
+        effective_fourier,
         fit_leftover_fourier,
         format_prims,
         fourier_rss,
         phase_variant_functions,
-        scale_fcs_to_ptp,
         _solve_leftover_linear,
     )
     import os as _os
@@ -729,14 +765,16 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
         return MultiDihedFcn(idxs, prims)
 
     orig_dfcn = GetMultiDihedFcnFromIdxs(mol, idxs)
-    rss_orig, _c_orig, _v_orig, r2_orig = fourier_rss(angs, y, orig_dfcn)
+    rss_orig, _c_orig, _v_orig, r2_orig = fourier_rss(
+        angs, y, orig_dfcn, instance_angs=instance_angs
+    )
     print(
-        f"[fit] orig vs leftover: {format_prims(orig_dfcn)}  "
+        f"[fit] orig vs leftover (instance-sum): {format_prims(orig_dfcn)}  "
         f"rss={rss_orig:.4g} r²={r2_orig:.4f}"
     )
 
     bestdfcn, _x, fit_info = fit_leftover_fourier(
-        angs, y, nprim, idxs, pname=pname
+        angs, y, nprim, idxs, pname=pname, instance_angs=instance_angs
     )
     phase_search = str(_os.environ.get("FFPOPT_DIHED_PHASE_SEARCH", "")).strip().lower() in {
         "1", "true", "yes", "on",
@@ -746,17 +784,26 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
             f"[fit] {pname}: extra 0°/180° phase search "
             "(FFPOPT_DIHED_PHASE_SEARCH=1; signed PK already covers this)"
         )
-        best_rss, _, _, _ = fourier_rss(angs, y, bestdfcn)
+        best_rss, _, _, _ = fourier_rss(
+            angs, y, bestdfcn, instance_angs=instance_angs
+        )
         for dfcn in phase_variant_functions(idxs, len(bestdfcn.prims)):
             A = np.zeros((npts, len(dfcn.prims) + 1))
             for i, prim in enumerate(dfcn.prims):
-                A[:, i] = np.cos(
-                    np.deg2rad(float(prim.per) * angs + float(prim.phase))
+                A[:, i] = np.sum(
+                    np.cos(
+                        np.deg2rad(
+                            float(prim.per) * instance_angs + float(prim.phase)
+                        )
+                    ),
+                    axis=1,
                 )
             A[:, -1] = 1.0
             xph, _info = _solve_leftover_linear(A, y)
             dfcn.SetFCs(clip_dihed_fcs(xph[: len(dfcn.prims)]))
-            rss_ph, _, _, _ = fourier_rss(angs, y, dfcn)
+            rss_ph, _, _, _ = fourier_rss(
+                angs, y, dfcn, instance_angs=instance_angs
+            )
             if rss_ph < best_rss:
                 best_rss = rss_ph
                 bestdfcn = dfcn
@@ -772,17 +819,20 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
     except (TypeError, ValueError):
         leftover_slack = 1.15
     leftover_cap = max(y_ptp * leftover_slack, 0.5)
-    ptp_before = dense_torsion_ptp(bestdfcn)
-    if ptp_before > leftover_cap:
-        scale_fcs_to_ptp(bestdfcn, leftover_cap)
-        print(
-            f"[fit] leftover-ptp cap at {pname}: V {ptp_before:.2f} -> "
-            f"{dense_torsion_ptp(bestdfcn):.2f} kcal/mol "
-            f"(leftover ptp={y_ptp:.2f})"
-        )
-    apply_chemical_rotor_policy(bestdfcn, pname, where=pname)
+    chem_cap = chemical_barrier_cap(pname)
+    target = min(leftover_cap, chem_cap)
+    v_eff = effective_fourier(bestdfcn, instance_angs)
+    ptp_eff = float(np.max(v_eff) - np.min(v_eff)) if v_eff.size else 0.0
+    print(
+        f"[fit] {pname}: one-quartet ptp={dense_torsion_ptp(bestdfcn):.2f}  "
+        f"instance-sum ptp={ptp_eff:.2f} leftover ptp={y_ptp:.2f} "
+        f"caps leftover={leftover_cap:.2f} chemical={chem_cap:.2f}"
+    )
+    cap_effective_ptp(bestdfcn, instance_angs, target, where=pname)
 
-    rss_fit, const_fit, v_fit, r2_fit = fourier_rss(angs, y, bestdfcn)
+    rss_fit, const_fit, v_fit, r2_fit = fourier_rss(
+        angs, y, bestdfcn, instance_angs=instance_angs
+    )
     min_rel = 0.02
     try:
         min_rel = float(_os.environ.get("FFPOPT_DIHED_MIN_REL_IMPROVE", "0.02"))
@@ -808,12 +858,18 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
         )
     if keep_orig:
         bestdfcn = _pad_to_nprim(copy.deepcopy(orig_dfcn))
-        rss_fit, const_fit, v_fit, r2_fit = fourier_rss(angs, y, bestdfcn)
+        rss_fit, const_fit, v_fit, r2_fit = fourier_rss(
+            angs, y, bestdfcn, instance_angs=instance_angs
+        )
 
+    v_eff = effective_fourier(bestdfcn, instance_angs)
+    ptp_eff = float(np.max(v_eff) - np.min(v_eff)) if v_eff.size else 0.0
     print(
         f"[fit] {pname}: {format_prims(bestdfcn)}  "
-        f"ptp={dense_torsion_ptp(bestdfcn):.2f} kcal/mol "
-        f"rss={rss_fit:.4g} r²={r2_fit:.4f} keep_orig={keep_orig}"
+        f"one-quartet ptp={dense_torsion_ptp(bestdfcn):.2f} "
+        f"instance-sum ptp={ptp_eff:.2f} kcal/mol "
+        f"rss={rss_fit:.4g} r²={r2_fit:.4f} keep_orig={keep_orig} "
+        f"ninst={len(inst)}"
     )
     append_fit_trace(
         {
@@ -1400,7 +1456,8 @@ class FitInputType(object):
 
             
             dfcns = IsolatedLinearSolve\
-                (bests.mol,bestidxs,llgeoms,hlenes,nprim,pname)
+                (bests.mol,bestidxs,llgeoms,hlenes,nprim,pname,
+                 instance_idxs=bestpinst.dihedidxs)
             
             bestpinst.ptype.dfcns = dfcns
         return self.get_params()

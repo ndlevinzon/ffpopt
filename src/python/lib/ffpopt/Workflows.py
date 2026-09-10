@@ -12,6 +12,24 @@ def _python() -> str:
     return sys.executable or "python3"
 
 
+def _run_child(cmd) -> None:
+    """Run a child so its stdout lands in the fragment tee log.
+
+    ``tee_job_stdio`` wraps ``sys.stdout`` in Python; children still write
+    OS fd 1 unless we pass the log file handle.
+    """
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = env.get("PYTHONIOENCODING") or "utf-8"
+    run_kw = {"check": True, "env": env}
+    log_fh = getattr(sys.stdout, "file_stream", None)
+    if log_fh is not None:
+        log_fh.flush()
+        run_kw["stdout"] = log_fh
+        run_kw["stderr"] = log_fh
+    subprocess.run(cmd, **run_kw)
+
+
 class _TwistParam(object):
     """ Per-bond torsion parameter record used by the twist workflow.
 
@@ -221,10 +239,21 @@ def _resolve_scans_and_params(mol, bonds, nprim: int, bytype: bool, scans_per_ty
             )
 
     uparams = list(set(allparams))
+    scan_types = {s.GetParamByType() for s in scans}
+    dropped = [n for n in uparams if n not in scan_types]
+    if dropped:
+        print(
+            "[fit] not fitting extra types on the scanned bond(s) "
+            f"(leave at GAFF): {', '.join(dropped)}. "
+            "Fitting both independently dumps the same leftover into two Fourier series."
+        )
+    uparams = [n for n in uparams if n in scan_types]
     s_template = {"output": None, "params": {}, "profiles": []}
     params = {}
     if not bytype:
         for name in ps:
+            if name not in scan_types:
+                continue
             s_template["params"][name] = ps[name].instances
         for name in uparams:
             params[name] = {"nprim": nprim, "masks": None}
@@ -233,6 +262,9 @@ def _resolve_scans_and_params(mol, bonds, nprim: int, bytype: bool, scans_per_ty
             typestr = name.split("_")[1]
             ts = [f"@%{t}" for t in typestr.split("-")]
             params[name] = {"nprim": nprim, "masks": [ts]}
+        print(
+            f"[fit] bytype families to fit: {', '.join(uparams) or '(none)'}"
+        )
 
     return scans, params, s_template
 
@@ -460,9 +492,8 @@ def _run_gendihedfit(citname: str, nlmaxiter: int, skip_existing: bool) -> None:
     gendihed = shutil.which("ffpopt-GenDihedFit.py")
     if gendihed is None:
         raise FileNotFoundError("ffpopt-GenDihedFit.py is not on PATH")
-    subprocess.run(
-        [_python(), gendihed, f"--nlmaxiter={nlmaxiter}", f"{citname}.fit.json"],
-        check=True,
+    _run_child(
+        [_python(), "-u", gendihed, f"--nlmaxiter={nlmaxiter}", f"{citname}.fit.json"],
     )
 
 
@@ -705,23 +736,23 @@ def _apply_fit_and_prepare(
         )
     else:
         print(f"[twist] applying fit → {parm_out}  (script={citname}.py  from={origparm})")
-        subprocess.run(
-            [_python(), f"{citname}.py", origparm, parm_out], check=True
+        _run_child(
+            [_python(), "-u", f"{citname}.py", origparm, parm_out],
         )
         print(f"[twist] PrepareInput → {json_out}")
         prepare = shutil.which("ffpopt-PrepareInput.py")
         if prepare is None:
             raise FileNotFoundError("ffpopt-PrepareInput.py is not on PATH")
-        subprocess.run(
+        _run_child(
             [
                 _python(),
+                "-u",
                 prepare,
                 "--update",
                 f"--parm={parm_out}",
                 f"--crd={inp}",
                 f"--out={json_out}",
-            ],
-            check=True,
+            ]
         )
     _log_applied_dihed_delta(origparm, parm_out, scans)
 

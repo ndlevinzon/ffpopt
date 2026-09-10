@@ -324,3 +324,32 @@ def test_fourier_rss_prefers_true_cosine_over_zero():
     assert rss_good < 0.5 * rss_zero
     assert r2_good > r2_zero
     assert r2_good > 0.99
+
+
+def test_instance_sum_prefers_n3_for_c3_rotor():
+    fit_leftover_fourier = reg.fit_leftover_fourier
+    effective_fourier = reg.effective_fourier
+
+    phi = np.linspace(0.0, 350.0, 36)
+    inst = np.column_stack([phi, phi + 120.0, phi + 240.0])
+    y = 2.4 * np.cos(np.deg2rad(3.0 * phi))
+    with patch.dict(
+        os.environ,
+        {
+            "FFPOPT_DIHED_NPRIM_SELECT": "1",
+            "FFPOPT_DIHED_IRLS": "0",
+            "FFPOPT_DIHED_RIDGE_LAMBDA": "0",
+        },
+        clear=False,
+    ):
+        dfcn, _x, info = fit_leftover_fourier(
+            phi, y, 3, [0, 1, 2, 3], pname="test-c3", instance_angs=inst
+        )
+    pks = [float(p.fc) for p in dfcn.prims]
+    by_per = {int(p.per): float(p.fc) for p in dfcn.prims}
+    assert abs(by_per.get(1, 0.0)) < 0.25
+    assert abs(by_per.get(3, 0.0)) == pytest.approx(0.8, abs=0.2)
+    v = effective_fourier(dfcn, inst)
+    rss, _c, _vv, r2 = reg.fourier_rss(phi, y, dfcn, instance_angs=inst)
+    assert r2 > 0.95
+    assert abs(pks[0]) < abs(by_per[3]) + 0.05

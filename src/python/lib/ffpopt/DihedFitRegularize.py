@@ -314,31 +314,96 @@ def format_prims(dfcn) -> str:
     return "; ".join(parts)
 
 
-def design_cosine_matrix(angs, periods, phases=None) -> np.ndarray:
-    """Design matrix ``[cos(n φ + γ), 1]``.
+def design_cosine_matrix(angs, periods, phases=None, instance_angs=None) -> np.ndarray:
+    """Design matrix ``[Σ_j cos(n φ_j + γ), 1]``.
 
     Amber writes ``PK (1 + cos(nφ + γ))``. The extra ``PK`` is a DC term
     collinear with a constant column, so fitting ``1+cos`` plus a constant
     is rank-deficient and invents huge cancelling PKs. Cosine columns
     plus one intercept recover the same shape with a well-posed SVD.
+
+    When ``instance_angs`` is ``(npts, ninst)``, each column is the sum
+    over type-equivalent quartets. For a C3 rotor (offsets 0/120/240)
+    the n=1 and n=2 columns vanish and only n=3 survives — matching
+    the scanned total energy, not one sulfonyl oxygen.
     """
 
-    angs = np.asarray(angs, dtype=float).reshape(-1)
+    if instance_angs is None:
+        instance_angs = np.asarray(angs, dtype=float).reshape(-1, 1)
+    else:
+        instance_angs = np.asarray(instance_angs, dtype=float)
+        if instance_angs.ndim == 1:
+            instance_angs = instance_angs.reshape(-1, 1)
     periods = list(periods)
     n = len(periods)
-    A = np.empty((angs.size, n + 1), dtype=float)
+    A = np.empty((instance_angs.shape[0], n + 1), dtype=float)
     for i, per in enumerate(periods):
         ph = 0.0 if phases is None else float(phases[i])
-        A[:, i] = np.cos(np.deg2rad(float(per) * angs + ph))
+        A[:, i] = np.sum(
+            np.cos(np.deg2rad(float(per) * instance_angs + ph)), axis=1
+        )
     A[:, n] = 1.0
     return A
 
 
-def fourier_rss(angs, y, dfcn) -> tuple[float, float, np.ndarray, float]:
+def effective_fourier(dfcn, instance_angs) -> np.ndarray:
+    """Sum of ``V(φ_j)`` over type-equivalent instances (kcal/mol)."""
+
+    instance_angs = np.asarray(instance_angs, dtype=float)
+    if instance_angs.ndim == 1:
+        instance_angs = instance_angs.reshape(-1, 1)
+    npts = instance_angs.shape[0]
+    if dfcn is None or not getattr(dfcn, "prims", None):
+        return np.zeros(npts, dtype=float)
+    v = np.zeros(npts, dtype=float)
+    for j in range(instance_angs.shape[1]):
+        v = v + np.asarray(dfcn.CptEne(instance_angs[:, j]), dtype=float).reshape(-1)
+    return v
+
+
+def cap_effective_ptp(dfcn, instance_angs, target: float, *, where: str = "") -> float:
+    """Uniformly scale PKs so instance-sum ``V`` peak-to-peak ≤ ``target``."""
+
+    v = effective_fourier(dfcn, instance_angs)
+    ptp = float(np.max(v) - np.min(v)) if v.size else 0.0
+    if ptp <= 1.0e-12 or target <= 0 or ptp <= target:
+        return ptp
+    scale = float(target) / ptp
+    dfcn.SetFCs([float(p.fc) * scale for p in dfcn.prims])
+    new_ptp = float(
+        np.max(effective_fourier(dfcn, instance_angs))
+        - np.min(effective_fourier(dfcn, instance_angs))
+    )
+    if where:
+        print(
+            f"[fit] effective-ptp cap at {where}: {ptp:.2f} -> {new_ptp:.2f} "
+            f"kcal/mol (target={target:.2f})"
+        )
+    return new_ptp
+
+
+def chemical_barrier_cap(type_key: str) -> float:
+    """Peak-to-peak cap (kcal/mol) for the instance-sum torsion on a bond."""
+
+    kind = classify_dihed_rotor(type_key)
+    if kind == "sulfate_phosphate":
+        return _envf("FFPOPT_DIHED_SULFATE_BARRIER_CAP", 4.0)
+    if kind == "alkane":
+        return _envf("FFPOPT_DIHED_ALKANE_BARRIER_MAX", 5.0)
+    if kind in {"amine_ammonium", "alcohol_ether", "polar_sp3"}:
+        return _envf("FFPOPT_DIHED_POLAR_SP3_BARRIER_MAX", 8.0)
+    if kind == "sp3_sp3":
+        return _envf("FFPOPT_DIHED_SP3_BARRIER_MAX", 20.0)
+    return _envf("FFPOPT_DIHED_BARRIER_ABS", 30.0)
+
+
+def fourier_rss(angs, y, dfcn, instance_angs=None) -> tuple[float, float, np.ndarray, float]:
     """RSS of ``y`` vs ``V(φ)`` after an optimal constant offset."""
 
     y = np.asarray(y, dtype=float).reshape(-1)
-    if dfcn is None or not getattr(dfcn, "prims", None):
+    if instance_angs is not None:
+        v = effective_fourier(dfcn, instance_angs)
+    elif dfcn is None or not getattr(dfcn, "prims", None):
         v = np.zeros_like(y)
     else:
         v = np.asarray(dfcn.CptEne(angs), dtype=float).reshape(-1)
@@ -458,11 +523,14 @@ def _solve_leftover_linear(A: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, di
     return gcv_tikhonov_solve(A, y, lam=lam)
 
 
-def fit_leftover_fourier(angs, y, nprim_max: int, idxs, pname: str = ""):
+def fit_leftover_fourier(
+    angs, y, nprim_max: int, idxs, pname: str = "", instance_angs=None
+):
     """Fit Amber PKs to isolated leftover with cosine columns, GCV, AIC.
 
     Signed PK at phase 0° is equivalent (up to a constant) to a 180°
     term, so the old ``2^nprim`` phase enumeration is unnecessary.
+    ``instance_angs`` sums equivalent quartets so C3 rotors select n=3.
     """
 
     from .Dihedrals import GetDihedClasses
@@ -474,12 +542,25 @@ def fit_leftover_fourier(angs, y, nprim_max: int, idxs, pname: str = ""):
     best = None
     for nprim in orders:
         dfcn = GetDihedClasses(idxs=list(idxs))[nprim][0]
-        A = design_cosine_matrix(angs, [p.per for p in dfcn.prims])
+        A = design_cosine_matrix(
+            angs, [p.per for p in dfcn.prims], instance_angs=instance_angs
+        )
+        if pname and nprim == nprim_max:
+            coln = [
+                float(np.linalg.norm(A[:, i])) for i in range(len(dfcn.prims))
+            ]
+            print(
+                f"[fit] instance-sum column norms at {pname}: "
+                + ", ".join(
+                    f"n={p.per} ||cos||={n:.3g}"
+                    for p, n in zip(dfcn.prims, coln)
+                )
+            )
         x, info = _solve_leftover_linear(A, y)
         n_fc = len(dfcn.prims)
         pks = clip_dihed_fcs(x[:n_fc], where=f"{pname}:n{nprim}" if pname else "")
         dfcn.SetFCs(pks)
-        rss, const, _v, r2 = fourier_rss(angs, y, dfcn)
+        rss, const, _v, r2 = fourier_rss(angs, y, dfcn, instance_angs=instance_angs)
         aic = _aic(rss, y.size, nprim + 1)
         rec = (aic, rss, nprim, dfcn, x, info, const, r2)
         if best is None or aic < best[0]:

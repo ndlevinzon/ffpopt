@@ -84,3 +84,66 @@ def test_plot_comparison_ylabel_total_energy(tmp_path: Path):
     )
     assert out.is_file()
     assert out.stat().st_size > 0
+
+
+class _N3Fcn:
+    def CptEne(self, ang):
+        a = np.asarray(ang, dtype=float)
+        return np.cos(np.deg2rad(3.0 * a))
+
+
+def test_instance_sum_triples_n3_c3_rotor():
+    angles = np.linspace(0.0, 350.0, 36)
+    v_one = sa.instance_sum_mm_dihed(_N3Fcn(), angles, [0.0])
+    v_sum = sa.instance_sum_mm_dihed(_N3Fcn(), angles, [0.0, 120.0, -120.0])
+    np.testing.assert_allclose(v_sum, 3.0 * v_one, atol=1e-8)
+    assert float(np.max(v_sum) - np.min(v_sum)) == pytest.approx(
+        3.0 * float(np.max(v_one) - np.min(v_one)), abs=1e-8
+    )
+
+
+def test_isolate_adds_back_instance_sum_not_one_quartet():
+    angles = np.linspace(0.0, 350.0, 36)
+    offsets = [0.0, 120.0, -120.0]
+    v_sum = sa.instance_sum_mm_dihed(_N3Fcn(), angles, offsets)
+    v_one = sa.instance_sum_mm_dihed(_N3Fcn(), angles, [0.0])
+    other = 5.0 + 8.0 * np.sin(np.deg2rad(angles))
+    e_ll = other + v_sum
+    leftover = 0.2 * np.cos(np.deg2rad(angles))
+    e_hl = other + leftover
+    _a, v_target, v_mm = sa.isolate_dihedral_profiles(
+        angles, e_hl, angles, e_ll, v_sum
+    )
+    np.testing.assert_allclose(v_mm, v_sum, atol=1e-8)
+    np.testing.assert_allclose(v_target, leftover, atol=1e-8)
+    _a2, v_wrong, _v1 = sa.isolate_dihedral_profiles(
+        angles, e_hl, angles, e_ll, v_one
+    )
+    assert float(np.max(np.abs(v_wrong - leftover))) > 0.5
+
+
+def test_plot_comparison_extra_curve_and_caption(tmp_path: Path):
+    pytest.importorskip("matplotlib")
+    angles = np.linspace(0.0, 330.0, 12)
+    leftover = 4.0 * (1.0 - np.cos(np.deg2rad(angles)))
+    v_sum = 0.6 * (1.0 + np.cos(np.deg2rad(3.0 * angles)))
+    v_one = v_sum / 3.0
+    cmp = sa.compare_scans(angles, leftover, angles, v_sum)
+    out = tmp_path / "compare_xtb_vs_it01_1-2-3-4_dihed.png"
+    sa.plot_comparison(
+        angles,
+        leftover,
+        angles,
+        v_sum,
+        cmp,
+        out_path=out,
+        hl_label="leftover (HL − MM without type)",
+        ll_label="MM DIHE (instance-sum)",
+        ylabel="Dihedral term (kcal/mol, min-shifted)",
+        extra_curves=[
+            (angles, v_one, "one quartet (×3 on this bond)", {"linestyle": "--"})
+        ],
+        caption="ninst=3  instance-sum ptp=1.20  leftover ptp=8.00",
+    )
+    assert out.is_file()
+    assert out.stat().st_size > 0

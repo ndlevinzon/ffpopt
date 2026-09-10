@@ -477,7 +477,8 @@ def mm_dihedral_energy_from_parm(
     """ Amber Fourier DIHE energy (kcal/mol) for one quartet vs angle.
 
     This is the cosine series on the scanned 4-atom dihedral, not 1-4
-    elec/vdw and not the rest of the MM potential.
+    elec/vdw and not the rest of the MM potential. Prefer
+    :func:`mm_instance_sum_from_parm` for leftover isolation.
     """
     from .Dihedrals import GetMultiDihedFcnFromIdxs
 
@@ -491,6 +492,75 @@ def mm_dihedral_energy_from_parm(
     return np.array([float(fcn.CptEne(float(ang))) for ang in angles], dtype=float)
 
 
+def _dihedral_deg(coords: np.ndarray, q: Sequence[int]) -> float:
+    """Proper dihedral (degrees) from Cartesian coordinates."""
+
+    p0, p1, p2, p3 = (np.asarray(coords[int(i)], dtype=float) for i in q)
+    b0 = p0 - p1
+    b1 = p2 - p1
+    b2 = p3 - p2
+    n1 = np.linalg.norm(b1)
+    b1n = b1 / n1 if n1 > 1.0e-15 else b1
+    v = b0 - np.dot(b0, b1n) * b1n
+    w = b2 - np.dot(b2, b1n) * b1n
+    x = float(np.dot(v, w))
+    y = float(np.dot(np.cross(b1n, v), w))
+    return float(np.degrees(np.arctan2(y, x)))
+
+
+def instance_sum_mm_dihed(fcn, scan_angles, offsets) -> np.ndarray:
+    """Sum ``V(φ + δ_j)`` over type-equivalent instances (kcal/mol)."""
+
+    scan_angles = np.asarray(scan_angles, dtype=float)
+    offsets = np.asarray(offsets, dtype=float).ravel()
+    if offsets.size == 0:
+        offsets = np.array([0.0])
+    inst = np.add.outer(scan_angles, offsets)
+    v = np.zeros(scan_angles.shape[0], dtype=float)
+    for j in range(inst.shape[1]):
+        v = v + np.asarray(fcn.CptEne(inst[:, j]), dtype=float).reshape(-1)
+    return v
+
+
+def instance_offsets_from_parm(parm, scan_idxs, inst) -> list[float]:
+    """Mean φ offsets of type-equivalent quartets vs the scanned quartet."""
+
+    inst = [list(q) for q in inst] or [list(scan_idxs)]
+    coords = getattr(parm, "coordinates", None)
+    if coords is None:
+        n = len(inst)
+        if n <= 1:
+            return [0.0]
+        return [360.0 * float(j) / float(n) for j in range(n)]
+    coords = np.asarray(coords, dtype=float)
+    phi0 = _dihedral_deg(coords, scan_idxs)
+    out = []
+    for q in inst:
+        phi = _dihedral_deg(coords, q)
+        out.append(float((phi - phi0 + 180.0) % 360.0 - 180.0))
+    return out
+
+
+def mm_instance_sum_from_parm(parm, idxs, angles):
+    """Instance-sum and one-quartet Fourier along a scan (kcal/mol)."""
+
+    from .Dihedrals import GetMultiDihedFcnFromIdxs, type_equivalent_quartets_on_bond
+
+    idxs = [int(i) for i in idxs]
+    inst = type_equivalent_quartets_on_bond(parm, idxs)
+    offsets = instance_offsets_from_parm(parm, idxs, inst)
+    fcn = GetMultiDihedFcnFromIdxs(parm, idxs)
+    v_sum = instance_sum_mm_dihed(fcn, angles, offsets)
+    v_one = np.asarray(fcn.CptEne(np.asarray(angles, dtype=float)), dtype=float).reshape(-1)
+    return {
+        "fcn": fcn,
+        "inst": inst,
+        "offsets": offsets,
+        "v_sum": v_sum,
+        "v_one": v_one,
+    }
+
+
 def isolate_dihedral_profiles(
     hl_angles: Sequence[float],
     hl_energies: Sequence[float],
@@ -498,17 +568,20 @@ def isolate_dihedral_profiles(
     ll_energies: Sequence[float],
     mm_dihed_energy,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """ Isolate the scanned dihedral term from two total-energy profiles.
+    """ Isolate the scanned dihedral *type* from two total-energy profiles.
 
     On a common angle grid::
 
         V_target(φ) = E_HL(φ) - E_MM(φ) + V_MM(φ)
-                    = E_HL(φ) - E_MM_without_this_DIHE(φ)
+                    = E_HL(φ) - E_MM_without_this_type(φ)
 
-    ``V_MM`` is the Amber Fourier series for the quartet. ``V_target`` is
+    ``V_MM`` must be the Amber Fourier contribution that the leftover fit
+    actually removes: the **instance-sum** over type-equivalent quartets
+    on the central bond, not a single scanned oxygen. ``V_target`` is
     what that series is supposed to match (QM leftover after other MM
     terms). A constant offset from independently min-shifted scan files
     is harmless: callers min-shift again for plotting / comparison.
+
 
     Parameters
     ----------
@@ -534,9 +607,17 @@ def isolate_dihedral_profiles(
         e_hl_c = _interpolate_to(a_ll, a_hl, e_hl)
 
     if callable(mm_dihed_energy):
-        v_mm = np.array(
-            [float(mm_dihed_energy(float(ang))) for ang in angles], dtype=float
-        )
+        v_try = np.array([])
+        try:
+            v_try = np.asarray(mm_dihed_energy(angles), dtype=float).ravel()
+        except Exception:
+            v_try = np.array([])
+        if v_try.shape == angles.shape:
+            v_mm = v_try
+        else:
+            v_mm = np.array(
+                [float(mm_dihed_energy(float(ang))) for ang in angles], dtype=float
+            )
     else:
         v_mm = np.asarray(mm_dihed_energy, dtype=float).ravel()
         if v_mm.shape != angles.shape:
@@ -571,8 +652,9 @@ def compare_scan_files(
     When ``plot_path`` is given, also calls :func:`plot_comparison` to save
     a PNG with extrema highlighted, the matched-pair connections, and the
     list of failed criteria. When ``dihed_plot_path``, ``parm_path``, and
-    ``dihed_idxs`` are given, a second PNG isolates the Fourier DIHE term
-    against the QM leftover ``E_HL - E_MM + V_MM``.
+    ``dihed_idxs`` are given, a second PNG isolates the **instance-sum**
+    Fourier DIHE (all type-equivalent quartets on the bond) against the
+    QM leftover ``E_HL - E_MM + V_type``.
 
     Parameters
     ----------
@@ -634,37 +716,49 @@ def compare_scan_files(
         and dihed_idxs is not None
     ):
         try:
-            from .Dihedrals import GetMultiDihedFcnFromIdxs
+            from .Dihedrals import summarize_rotors_on_bond
             import parmed
 
             parm = parmed.load_file(str(parm_path))
-            fcn = GetMultiDihedFcnFromIdxs(parm, list(dihed_idxs))
+            packed = mm_instance_sum_from_parm(parm, list(dihed_idxs), [0.0])
+            fcn = packed["fcn"]
+            offsets = packed["offsets"]
+            ninst = len(packed["inst"])
+
+            def _v_sum(angs):
+                return instance_sum_mm_dihed(fcn, angs, offsets)
+
             angles, v_target, v_mm = isolate_dihedral_profiles(
-                a_hl, e_hl, a_ll, e_ll, fcn.CptEne
+                a_hl, e_hl, a_ll, e_ll, _v_sum
             )
+            v_one = instance_sum_mm_dihed(fcn, angles, [0.0])
             v_ptp = float(np.max(v_mm) - np.min(v_mm)) if len(v_mm) else 0.0
+            v_one_ptp = (
+                float(np.max(v_one) - np.min(v_one)) if len(v_one) else 0.0
+            )
             y_ptp = (
                 float(np.max(v_target) - np.min(v_target)) if len(v_target) else 0.0
             )
             pks = [round(float(p.fc), 4) for p in fcn.prims]
+            off_str = ", ".join(f"{o:.1f}" for o in offsets)
             print(
                 f"[plot] dihed PNG={dihed_plot_path} parm={parm_path} "
-                f"idxs={list(dihed_idxs)} HL={hl_path} LL={ll_path}"
+                f"idxs={list(dihed_idxs)} HL={hl_path} LL={ll_path} "
+                f"ninst={ninst} offsets=[{off_str}]"
             )
             print(
-                f"[plot]   MM DIHE ptp={v_ptp:.3f} leftover ptp={y_ptp:.3f} "
-                f"kcal/mol PKs={pks} phases={[round(float(p.phase), 1) for p in fcn.prims]}"
+                f"[plot]   MM DIHE one-quartet ptp={v_one_ptp:.3f} "
+                f"instance-sum ptp={v_ptp:.3f} leftover ptp={y_ptp:.3f} "
+                f"kcal/mol PKs={pks} "
+                f"phases={[round(float(p.phase), 1) for p in fcn.prims]}"
             )
             if v_ptp < 0.05:
                 print(
                     f"[plot] MM DIHE is flat for {list(dihed_idxs)} in "
-                    f"{parm_path} (ptp={v_ptp:.3f} kcal/mol, PKs={pks}). "
-                    "This quartet has no Fourier amplitude; leftover is "
-                    "E_HL-E_MM, not an isolated torsion."
+                    f"{parm_path} (instance-sum ptp={v_ptp:.3f} kcal/mol, "
+                    f"PKs={pks}). leftover is E_HL-E_MM, not an isolated torsion."
                 )
                 try:
-                    from .Dihedrals import summarize_rotors_on_bond
-
                     sib = summarize_rotors_on_bond(parm, list(dihed_idxs))
                     if sib:
                         print(
@@ -675,6 +769,26 @@ def compare_scan_files(
                             print(f"[plot] {line}")
                 except Exception:
                     pass
+            extra = None
+            if ninst > 1:
+                extra = [
+                    (
+                        angles,
+                        v_one,
+                        f"one quartet (×{ninst} on this bond)",
+                        {
+                            "linestyle": "--",
+                            "color": "0.45",
+                            "linewidth": 1.1,
+                            "marker": "",
+                        },
+                    )
+                ]
+            caption = (
+                f"ninst={ninst}  offsets=[{off_str}]°\n"
+                f"one-quartet ptp={v_one_ptp:.2f}  "
+                f"instance-sum ptp={v_ptp:.2f}  leftover ptp={y_ptp:.2f} kcal/mol"
+            )
             dihed_cmp = compare_scans(angles, v_target, angles, v_mm, config=config)
             plot_comparison(
                 angles,
@@ -684,15 +798,17 @@ def compare_scan_files(
                 dihed_cmp,
                 out_path=dihed_plot_path,
                 title=(
-                    (plot_title + "  [DIHE]")
+                    (plot_title + "  [DIHE instance-sum]")
                     if plot_title
-                    else f"{hl_leg} vs {ll_leg}  [DIHE]"
+                    else f"{hl_leg} vs {ll_leg}  [DIHE instance-sum]"
                 ),
-                hl_label="HL - MM_other",
-                ll_label="MM DIHE",
+                hl_label="leftover (HL − MM without type)",
+                ll_label="MM DIHE (instance-sum)",
                 config=config,
                 structure_image_path=structure_image_path,
                 ylabel="Dihedral term (kcal/mol, min-shifted)",
+                extra_curves=extra,
+                caption=caption,
             )
         except Exception as exc:
             print(f"[plot] skip dihedral-term plot ({dihed_plot_path}): {exc}")
@@ -774,6 +890,8 @@ def plot_comparison(
     config: ScanCompareConfig | None = None,
     structure_image_path: str | Path | None = None,
     ylabel: str = "Total energy (kcal/mol, min-shifted)",
+    extra_curves=None,
+    caption: str | None = None,
 ) -> Path:
     """ Save a comparison plot for two dihedral scan profiles.
 
@@ -821,6 +939,12 @@ def plot_comparison(
         panel. Default is None (no structure panel).
     ylabel : str, optional
         Y-axis label. Default is total (min-shifted) potential energy.
+    extra_curves : sequence of tuple, optional
+        Extra ``(angles, energies, label, plot_kwargs)`` series, each
+        min-shifted independently. Used for the one-quartet Fourier when
+        the main LL curve is the instance-sum.
+    caption : str, optional
+        Annotation drawn inside the scan panel (ptp / ninst).
 
     Returns
     -------
@@ -868,6 +992,25 @@ def plot_comparison(
 
     ax.plot(a_hl, e_hl, "-o", color="tab:blue", label=hl_label, markersize=4, linewidth=1.4)
     ax.plot(a_ll, e_ll, "-s", color="tab:orange", label=ll_label, markersize=4, linewidth=1.4)
+    if extra_curves:
+        for extra in extra_curves:
+            a_ex, e_ex, ex_label, style = extra
+            a_ex, e_ex = _to_sorted_arrays(a_ex, e_ex)
+            e_ex = e_ex - e_ex.min()
+            kw = dict(style or {})
+            ax.plot(a_ex, e_ex, label=ex_label, **kw)
+    if caption:
+        ax.text(
+            0.02,
+            0.02,
+            caption,
+            transform=ax.transAxes,
+            va="bottom",
+            ha="left",
+            fontsize=8,
+            family="monospace",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.85),
+        )
 
     def _draw_extrema(extrema, unmatched, base_color):
         for i, (ang, en, kind) in enumerate(extrema):

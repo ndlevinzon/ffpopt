@@ -377,6 +377,48 @@ def summarize_rotors_on_bond(p, idxs):
     return lines
 
 
+def _quartet_key(idxs):
+    q = tuple(int(i) for i in idxs)
+    return q if q <= q[::-1] else q[::-1]
+
+
+def type_equivalent_quartets_on_bond(p, idxs):
+    """Proper quartets on the scanned central bond with the same atom types.
+
+    Reverse type strings (``o-s6-c3-c3`` vs ``c3-c3-s6-o``) count as the
+    same family. Hydrogen / extra types on the same bond are excluded.
+    The scanned quartet is first when present.
+    """
+
+    idxs = [int(i) for i in idxs]
+    t = tuple(p.atoms[i].type for i in idxs)
+    t_rev = t[::-1]
+    a, b = idxs[1], idxs[2]
+    scan_key = _quartet_key(idxs)
+    found = []
+    seen = set()
+    for x in p.dihedrals:
+        if x.improper:
+            continue
+        q = [x.atom1.idx, x.atom2.idx, x.atom3.idx, x.atom4.idx]
+        if not ((q[1] == a and q[2] == b) or (q[1] == b and q[2] == a)):
+            continue
+        types = tuple(p.atoms[i].type for i in q)
+        if types != t and types != t_rev:
+            continue
+        key = _quartet_key(q)
+        if key in seen:
+            continue
+        seen.add(key)
+        if q[1] == a and q[2] == b:
+            found.append(q)
+        else:
+            found.append(q[::-1])
+    ordered = [q for q in found if _quartet_key(q) == scan_key]
+    ordered.extend(q for q in found if _quartet_key(q) != scan_key)
+    return ordered or [list(idxs)]
+
+
 def GetMultiDihedFcnFromIdxs(p,idxs):
     """ Get a MultiDihedFcn object from the Parm object p using the given indices.
     
@@ -885,7 +927,7 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname, instance_idxs=None):
             f"[fit] leftover is not a Fourier torsion (r²={r2_fit:.3f}). "
             f"The {y_ptp:.1f} kcal leftover is mostly 1-4/vdw; this type can "
             f"only move the scan barrier by ~{ptp_eff:.1f} kcal (instance-sum), "
-            "so orig vs itNN one-quartet _dihed.png will stay nearly flat."
+            "so _dihed.png leftover ptp will dwarf the MM DIHE curve."
         )
     append_fit_trace(
         {

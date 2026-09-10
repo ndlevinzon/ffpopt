@@ -539,8 +539,8 @@ def _compare_per_bond(
     Compares ``{hl_prefix}_{idxs}.dat`` against ``{ll_prefix}_{idxs}.dat``
     bond-by-bond (total potential energy). When ``plot_dir`` is set, writes
     ``compare_{hl_prefix}_vs_{tag}_{idxs}.png`` (total energy) and, when
-    ``parm_path`` is set, ``compare_{hl_prefix}_vs_{tag}_{idxs}_dihed.png``
-    (isolated Fourier DIHE vs QM leftover). ``tag`` is ``plot_ll_tag`` or
+    ``parm_path`` is set,     ``compare_{hl_prefix}_vs_{tag}_{idxs}_dihed.png``
+    (instance-sum Fourier DIHE vs QM leftover). ``tag`` is ``plot_ll_tag`` or
     ``ll_prefix``.
 
     Parameters
@@ -899,9 +899,9 @@ def run_dihed_twist_workflow(
     plot_comparisons : bool, optional
         If True, save PNGs per bond per comparison alongside the ``.dat``
         files: ``compare_{hl}_vs_{ll}_{idxs}.png`` (total energy) and
-        ``compare_{hl}_vs_{ll}_{idxs}_dihed.png`` (isolated Fourier DIHE).
-        After fitting, the same pair is also written with ``ll=final``.
-        Default is False.
+        ``compare_{hl}_vs_{ll}_{idxs}_dihed.png`` (instance-sum Fourier DIHE
+        vs leftover). After fitting, the same pair is also written with
+        ``ll=final``. Default is False.
     structure_images : dict, optional
         Map of ``frozenset({a, b})`` (0-based central-bond atom indices)
         to a 2D structure image path (PNG or SVG). When provided alongside

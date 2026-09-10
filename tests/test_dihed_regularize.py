@@ -407,3 +407,38 @@ def test_reuse_ll_scan_files_copies_dat_and_json(tmp_path, monkeypatch):
     wf._reuse_ll_scan_files([_Scan([1, 2, 3, 4])], "it01", "it02")
     assert (tmp_path / "it02_1-2-3-4.dat").read_text() == "scan"
     assert (tmp_path / "it02_1-2-3-4.json").read_text() == "{}"
+
+
+def test_type_equivalent_quartets_skip_hydrogen_siblings():
+    type_equivalent_quartets_on_bond = dihed.type_equivalent_quartets_on_bond
+
+    class _Atom:
+        def __init__(self, idx, typ):
+            self.idx = idx
+            self.type = typ
+
+    class _Dihed:
+        improper = False
+
+        def __init__(self, atoms, q):
+            self.atom1, self.atom2, self.atom3, self.atom4 = (atoms[i] for i in q)
+
+    atoms = [
+        _Atom(i, t)
+        for i, t in enumerate(["x", "c3", "c3", "s6", "o", "o", "o", "h1"])
+    ]
+
+    class _Parm:
+        def __init__(self):
+            self.atoms = atoms
+            self.dihedrals = [
+                _Dihed(atoms, [1, 2, 3, 4]),
+                _Dihed(atoms, [1, 2, 3, 5]),
+                _Dihed(atoms, [1, 2, 3, 6]),
+                _Dihed(atoms, [4, 3, 2, 7]),
+            ]
+
+    got = type_equivalent_quartets_on_bond(_Parm(), [1, 2, 3, 4])
+    keys = {tuple(q) if tuple(q) <= tuple(q[::-1]) else tuple(q[::-1]) for q in got}
+    assert keys == {(1, 2, 3, 4), (1, 2, 3, 5), (1, 2, 3, 6)}
+    assert got[0] == [1, 2, 3, 4]

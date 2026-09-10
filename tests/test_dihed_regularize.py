@@ -233,3 +233,94 @@ def test_scale_fcs_to_leftover_ptp():
     assert dense_torsion_ptp(dfcn) > 30.0
     scale_fcs_to_ptp(dfcn, 5.0)
     assert dense_torsion_ptp(dfcn) == pytest.approx(5.0, rel=0.02)
+
+
+def test_cosine_design_recovers_known_pk():
+    design_cosine_matrix = reg.design_cosine_matrix
+    fit_leftover_fourier = reg.fit_leftover_fourier
+    fourier_rss = reg.fourier_rss
+
+    angs = np.linspace(0.0, 350.0, 36)
+    A = design_cosine_matrix(angs, [1, 2, 3])
+    assert A.shape == (36, 4)
+    cond = float(np.linalg.cond(A))
+    assert cond < 50.0
+
+    y = 2.0 * np.cos(np.deg2rad(angs)) + 4.0
+    with patch.dict(
+        os.environ,
+        {
+            "FFPOPT_DIHED_NPRIM_SELECT": "1",
+            "FFPOPT_DIHED_IRLS": "0",
+            "FFPOPT_DIHED_RIDGE_LAMBDA": "0",
+        },
+        clear=False,
+    ):
+        dfcn, x, info = fit_leftover_fourier(
+            angs, y, 3, [0, 1, 2, 3], pname="test-cos"
+        )
+    assert info["nprim"] == 1
+    assert float(dfcn.prims[0].fc) == pytest.approx(2.0, abs=0.15)
+    rss, _c, _v, r2 = fourier_rss(angs, y, dfcn)
+    assert r2 > 0.99
+    assert rss < 0.05
+
+
+def test_cosine_design_stable_on_clustered_angles():
+    fit_leftover_fourier = reg.fit_leftover_fourier
+
+    angs = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 180.0])
+    rng = np.random.default_rng(0)
+    y = np.cos(np.deg2rad(angs)) + 0.02 * rng.normal(size=angs.size)
+    with patch.dict(
+        os.environ,
+        {
+            "FFPOPT_DIHED_NPRIM_SELECT": "1",
+            "FFPOPT_DIHED_IRLS": "1",
+        },
+        clear=False,
+    ):
+        dfcn, _x, info = fit_leftover_fourier(
+            angs, y, 3, [0, 1, 2, 3], pname="test-cluster"
+        )
+    pks = [abs(float(p.fc)) for p in dfcn.prims]
+    assert max(pks) < 8.0
+    assert info.get("cond") is not None
+
+
+def test_signed_pk_matches_phase_180_leftover():
+    fit_leftover_fourier = reg.fit_leftover_fourier
+
+    angs = np.linspace(0.0, 350.0, 36)
+    y = 1.8 * (1.0 - np.cos(np.deg2rad(angs)))
+    with patch.dict(
+        os.environ,
+        {
+            "FFPOPT_DIHED_NPRIM_SELECT": "1",
+            "FFPOPT_DIHED_IRLS": "0",
+            "FFPOPT_DIHED_RIDGE_LAMBDA": "0",
+        },
+        clear=False,
+    ):
+        dfcn, _x, info = fit_leftover_fourier(
+            angs, y, 3, [0, 1, 2, 3], pname="test-180"
+        )
+    assert info["nprim"] == 1
+    assert float(dfcn.prims[0].fc) == pytest.approx(-1.8, abs=0.2)
+
+
+def test_fourier_rss_prefers_true_cosine_over_zero():
+    fourier_rss = reg.fourier_rss
+    GetDihedClasses = dihed.GetDihedClasses
+
+    angs = np.linspace(0.0, 350.0, 36)
+    y = 1.2 * np.cos(np.deg2rad(angs))
+    zero = GetDihedClasses(idxs=[0, 1, 2, 3])[1][0]
+    zero.SetFCs([0.0])
+    good = GetDihedClasses(idxs=[0, 1, 2, 3])[1][0]
+    good.SetFCs([1.2])
+    rss_zero, _, _, r2_zero = fourier_rss(angs, y, zero)
+    rss_good, _, _, r2_good = fourier_rss(angs, y, good)
+    assert rss_good < 0.5 * rss_zero
+    assert r2_good > r2_zero
+    assert r2_good > 0.99

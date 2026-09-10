@@ -451,7 +451,10 @@ def _run_gendihedfit(citname: str, nlmaxiter: int, skip_existing: bool) -> None:
         If True and ``<citname>.py`` already exists, the call is skipped.
     """
     if skip_existing and Path(f"{citname}.py").exists():
-        print(f"[twist] {citname}.py exists — skipping GenDihedFit.")
+        print(
+            f"[twist] WARNING skip_existing: {citname}.py already on disk — "
+            "NOT running GenDihedFit. Delete it (and the matching .parm7) to force a new fit."
+        )
         return
     print(f"[twist] GenDihedFit → {citname}.py")
     gendihed = shutil.which("ffpopt-GenDihedFit.py")
@@ -573,6 +576,10 @@ def _compare_per_bond(
             hl_label=hl_prefix,
             ll_label=tag,
         )
+        print(
+            f"[plot] {hl_prefix} vs {tag} {idx}: HL={hl_path} LL={ll_path} "
+            f"parm={parm_path} totalPNG={plot_path} dihedPNG={dihed_plot_path}"
+        )
         _print_scan_comparison(hl_prefix, tag, idx, out[idx])
     return out
 
@@ -612,8 +619,61 @@ def _emit_final_comparisons(
     results["final_comparisons"] = final_comparisons
 
 
+def _log_applied_dihed_delta(origparm, parm_out, scans) -> None:
+    """Print orig vs applied Fourier PKs so identical _dihed.png is diagnosable."""
+
+    if not scans or not Path(str(origparm)).exists() or not Path(str(parm_out)).exists():
+        return
+    try:
+        import numpy as np
+        import parmed
+        from .Dihedrals import GetMultiDihedFcnFromIdxs, summarize_rotors_on_bond
+        from .DihedFitRegularize import format_prims
+    except Exception as exc:
+        print(f"[fit] skip parm PK audit ({parm_out}): {exc}")
+        return
+    try:
+        po = parmed.load_file(str(origparm))
+        pn = parmed.load_file(str(parm_out))
+    except Exception as exc:
+        print(f"[fit] skip parm PK audit ({parm_out}): {exc}")
+        return
+    any_change = False
+    angs = np.linspace(0.0, 360.0, 73)
+    for scan in scans:
+        idxs = list(scan.idxs)
+        idx = scan.GetIdxStr()
+        fo = GetMultiDihedFcnFromIdxs(po, idxs)
+        fn = GetMultiDihedFcnFromIdxs(pn, idxs)
+        vo = np.asarray(fo.CptEne(angs), dtype=float)
+        vn = np.asarray(fn.CptEne(angs), dtype=float)
+        vo = vo - float(np.min(vo))
+        vn = vn - float(np.min(vn))
+        dptp = float(np.max(np.abs(vn - vo))) if vo.size else 0.0
+        changed = dptp > 0.05
+        any_change = any_change or changed
+        print(f"[fit] apply {parm_out} {idx}: orig {format_prims(fo)}")
+        print(f"[fit] apply {parm_out} {idx}: new  {format_prims(fn)}")
+        if not changed:
+            print(
+                f"[fit] apply {parm_out} {idx}: NO-OP "
+                f"(Fourier unchanged, ΔV ptp={dptp:.3f} kcal/mol). "
+                "orig vs itNN _dihed.png will match for this quartet."
+            )
+        sib = summarize_rotors_on_bond(pn, idxs)
+        if len(sib) > 1:
+            print(f"[fit] other rotors on central bond {idxs[1]}-{idxs[2]}:")
+            for line in sib:
+                print(f"[fit] {line}")
+    if not any_change:
+        print(
+            f"[fit] WARNING: {parm_out} Fourier matches {origparm} on every "
+            "scanned quartet. Fitting did not change MM DIHE."
+        )
+
+
 def _apply_fit_and_prepare(
-    *, citname: str, origparm: str, inp: str, skip_existing: bool
+    *, citname: str, origparm: str, inp: str, skip_existing: bool, scans=None
 ) -> None:
     """ Apply the fit script to ``origparm`` and rebuild the JSON input.
 
@@ -639,27 +699,31 @@ def _apply_fit_and_prepare(
     parm_out = f"{citname}.parm7"
     json_out = f"{citname}.json"
     if skip_existing and Path(parm_out).exists() and Path(json_out).exists():
-        print(f"[twist] {parm_out} & {json_out} exist — skipping apply+prepare.")
-        return
-    print(f"[twist] applying fit → {parm_out}")
-    subprocess.run(
-        [_python(), f"{citname}.py", origparm, parm_out], check=True
-    )
-    print(f"[twist] PrepareInput → {json_out}")
-    prepare = shutil.which("ffpopt-PrepareInput.py")
-    if prepare is None:
-        raise FileNotFoundError("ffpopt-PrepareInput.py is not on PATH")
-    subprocess.run(
-        [
-            _python(),
-            prepare,
-            "--update",
-            f"--parm={parm_out}",
-            f"--crd={inp}",
-            f"--out={json_out}",
-        ],
-        check=True,
-    )
+        print(
+            f"[twist] WARNING skip_existing: {parm_out} & {json_out} already on disk — "
+            "NOT applying the fit script. Delete them to bake new PKs."
+        )
+    else:
+        print(f"[twist] applying fit → {parm_out}  (script={citname}.py  from={origparm})")
+        subprocess.run(
+            [_python(), f"{citname}.py", origparm, parm_out], check=True
+        )
+        print(f"[twist] PrepareInput → {json_out}")
+        prepare = shutil.which("ffpopt-PrepareInput.py")
+        if prepare is None:
+            raise FileNotFoundError("ffpopt-PrepareInput.py is not on PATH")
+        subprocess.run(
+            [
+                _python(),
+                prepare,
+                "--update",
+                f"--parm={parm_out}",
+                f"--crd={inp}",
+                f"--out={json_out}",
+            ],
+            check=True,
+        )
+    _log_applied_dihed_delta(origparm, parm_out, scans)
 
 
 def run_dihed_twist_workflow(
@@ -963,6 +1027,10 @@ def run_dihed_twist_workflow(
         citname = "it%02i" % (it + 1)
         parm = origparm if it == 0 else f"{pitname}.parm7"
         ll_prefix = "orig" if it == 0 else pitname
+        print(
+            f"[twist] ===== iteration {it + 1}/{args.maxiter}  {citname}  "
+            f"LL={ll_prefix} parm={parm}  fitting {len(scans)} dihedral(s) ====="
+        )
 
         # 3a. Write the fit.json input.
         fit_json = _write_fit_json(
@@ -985,6 +1053,7 @@ def run_dihed_twist_workflow(
             origparm=origparm,
             inp=args.inp,
             skip_existing=skip_existing,
+            scans=scans,
         )
         results["iterations"].append(
             {"parm": f"{citname}.parm7", "json": f"{citname}.json"}

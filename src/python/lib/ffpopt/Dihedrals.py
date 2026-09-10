@@ -334,6 +334,49 @@ def FindDihedrals(p,idxs,impropers=False):
 
 
 
+def format_parm_quartet(p, idxs) -> str:
+    """Log line: Fourier terms on one 4-atom quartet in ``p``."""
+
+    xs = FindDihedrals(p, idxs)
+    if not xs:
+        return f"{list(idxs)}: (absent from parm)"
+    bits = []
+    for x in xs:
+        t = x.type
+        bits.append(
+            f"PK={float(t.phi_k):.4f} n={int(t.per)} γ={float(t.phase):.0f}"
+        )
+    return f"{list(idxs)}: " + "; ".join(bits)
+
+
+def summarize_rotors_on_bond(p, idxs):
+    """Proper-dihedral terms that share the scanned central bond."""
+
+    a, b = int(idxs[1]), int(idxs[2])
+    groups = {}
+    for x in p.dihedrals:
+        if x.improper:
+            continue
+        i2, i3 = x.atom2.idx, x.atom3.idx
+        if not ((i2 == a and i3 == b) or (i2 == b and i3 == a)):
+            continue
+        q = (x.atom1.idx, x.atom2.idx, x.atom3.idx, x.atom4.idx)
+        key = q if q <= q[::-1] else q[::-1]
+        groups.setdefault(key, []).append(x)
+    lines = []
+    for q, xs in sorted(groups.items()):
+        pks = [
+            f"n={int(x.type.per)} PK={float(x.type.phi_k):.4f} γ={float(x.type.phase):.0f}"
+            for x in xs
+        ]
+        types = "-".join(p.atoms[i].type for i in q)
+        scanned = "  [scanned]" if (
+            tuple(idxs) == q or tuple(idxs) == q[::-1]
+        ) else ""
+        lines.append(f"  {list(q)} ({types}): {'; '.join(pks)}{scanned}")
+    return lines
+
+
 def GetMultiDihedFcnFromIdxs(p,idxs):
     """ Get a MultiDihedFcn object from the Parm object p using the given indices.
     
@@ -587,8 +630,19 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
 
     KCAL_PER_EV = AU_PER_ELECTRON_VOLT() / AU_PER_KCAL_PER_MOL()
 
+    print(f"[fit] ---- IsolatedLinearSolve {pname} quartet={list(idxs)} nprim={nprim} ----")
+    print(f"[fit] orig parm Fourier: {format_parm_quartet(mol, idxs)}")
+    rotors = summarize_rotors_on_bond(mol, idxs)
+    if rotors:
+        print(f"[fit] proper terms on central bond {idxs[1]}-{idxs[2]}:")
+        for line in rotors:
+            print(f"[fit] {line}")
+    print(
+        f"[fit] leftover MM: delete scanned quartet only, "
+        f"{len(losll)} geometries (sander, no GeomOpt)"
+    )
+
     graph = losll.structs[0].GetGraph()
-    dfcns = GetDihedClasses(idxs=idxs)[nprim]
     list_of_scans = [ losll ]
     cons = [ Constraint("dihed",idxs,graph=graph) ]
     list_of_enes = EnergyScansWithoutDihedrals(mol,list_of_scans,cons)
@@ -630,76 +684,90 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
     y = hlenes-llenes
     
     npts = len(y)
-
-    from .DihedFitRegularize import (
-        apply_chemical_rotor_policy,
-        dense_torsion_ptp,
-        fit_fourier_nprim,
-        nprim_select_enabled,
-        phase_variant_functions,
-        scale_fcs_to_ptp,
-        solve_regularized_fcs,
+    y_ptp = float(np.max(y) - np.min(y)) if npts else 0.0
+    y_std = float(np.std(y)) if npts else 0.0
+    print(
+        f"[fit] leftover y: n={npts} ptp={y_ptp:.3f} std={y_std:.3f} kcal/mol "
+        f"φ=[{float(np.min(angs)):.1f}, {float(np.max(angs)):.1f}]°"
     )
 
+    from .DihedFitRegularize import (
+        append_fit_trace,
+        apply_chemical_rotor_policy,
+        clip_dihed_fcs,
+        dense_torsion_ptp,
+        fit_leftover_fourier,
+        format_prims,
+        fourier_rss,
+        phase_variant_functions,
+        scale_fcs_to_ptp,
+        _solve_leftover_linear,
+    )
+    import os as _os
+
     def _pad_to_nprim(dfcn):
+        if dfcn is None:
+            return MultiDihedFcn(
+                idxs, [PrimDihedFcn(0.0, 0.0, n) for n in range(1, nprim + 1)]
+            )
         if len(dfcn.prims) == nprim:
             return dfcn
-        by_per = {p.per: p for p in dfcn.prims}
+        by_per = {}
+        for p in dfcn.prims:
+            key = (int(p.per), round(float(p.phase) % 360.0, 1))
+            by_per[key] = by_per.get(key, 0.0) + float(p.fc)
         prims = []
         for n in range(1, nprim + 1):
-            if n in by_per:
-                prims.append(PrimDihedFcn(by_per[n].fc, by_per[n].phase, n))
-            else:
-                prims.append(PrimDihedFcn(0.0, 0.0, n))
+            fc = 0.0
+            phase = 0.0
+            for (per, ph), val in by_per.items():
+                if per == n:
+                    fc = val
+                    phase = ph
+                    break
+            prims.append(PrimDihedFcn(fc, phase, n))
         return MultiDihedFcn(idxs, prims)
 
-    def _score(dfcn):
-        n_fc = len(dfcn.prims)
-        A = np.zeros((npts, n_fc + 1))
-        for iprim, prim in enumerate(dfcn.prims):
-            A[:, iprim] = prim.CptEterm(angs)
-        A[:, n_fc] = 1
-        x, info = solve_regularized_fcs(
-            A, y, dfcn=dfcn, where=pname, n_fc=n_fc
+    orig_dfcn = GetMultiDihedFcnFromIdxs(mol, idxs)
+    rss_orig, _c_orig, _v_orig, r2_orig = fourier_rss(angs, y, orig_dfcn)
+    print(
+        f"[fit] orig vs leftover: {format_prims(orig_dfcn)}  "
+        f"rss={rss_orig:.4g} r²={r2_orig:.4f}"
+    )
+
+    bestdfcn, _x, fit_info = fit_leftover_fourier(
+        angs, y, nprim, idxs, pname=pname
+    )
+    phase_search = str(_os.environ.get("FFPOPT_DIHED_PHASE_SEARCH", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if phase_search:
+        print(
+            f"[fit] {pname}: extra 0°/180° phase search "
+            "(FFPOPT_DIHED_PHASE_SEARCH=1; signed PK already covers this)"
         )
-        const = float(x[-1])
-        v = np.asarray(dfcn.CptEne(angs), dtype=float) + const
-        d = y - v
-        chisq = float(np.dot(d, d))
-        return chisq, copy.deepcopy(dfcn), v, info
-
-    bestdfcn = None
-    bestchisq = 1.e+30
-    bestvalues = []
-    if nprim_select_enabled() and nprim >= 1:
-        seed, _x, _info = fit_fourier_nprim(angs, y, nprim, idxs, pname=pname)
-        candidates = [_pad_to_nprim(seed)]
-        if len(seed.prims) <= 4:
-            candidates.extend(phase_variant_functions(idxs, len(seed.prims)))
-    else:
-        candidates = list(dfcns) + phase_variant_functions(idxs, nprim)
-
-    seen = set()
-    for dfcn in candidates:
-        key = tuple((round(p.phase, 1), int(p.per)) for p in dfcn.prims)
-        if key in seen:
-            continue
-        seen.add(key)
-        dfcn = copy.deepcopy(dfcn)
-        chisq, fitted, v, _info = _score(dfcn)
-        if chisq < bestchisq:
-            bestchisq = chisq
-            bestdfcn = fitted
-            bestvalues = v
+        best_rss, _, _, _ = fourier_rss(angs, y, bestdfcn)
+        for dfcn in phase_variant_functions(idxs, len(bestdfcn.prims)):
+            A = np.zeros((npts, len(dfcn.prims) + 1))
+            for i, prim in enumerate(dfcn.prims):
+                A[:, i] = np.cos(
+                    np.deg2rad(float(prim.per) * angs + float(prim.phase))
+                )
+            A[:, -1] = 1.0
+            xph, _info = _solve_leftover_linear(A, y)
+            dfcn.SetFCs(clip_dihed_fcs(xph[: len(dfcn.prims)]))
+            rss_ph, _, _, _ = fourier_rss(angs, y, dfcn)
+            if rss_ph < best_rss:
+                best_rss = rss_ph
+                bestdfcn = dfcn
 
     if bestdfcn is None:
         raise RuntimeError(f"IsolatedLinearSolve failed for {pname}")
     bestdfcn = _pad_to_nprim(bestdfcn)
-    y_ptp = float(np.max(y) - np.min(y))
     leftover_slack = 1.15
     try:
         leftover_slack = float(
-            __import__("os").environ.get("FFPOPT_DIHED_LEFTOVER_SLACK", "1.15")
+            _os.environ.get("FFPOPT_DIHED_LEFTOVER_SLACK", "1.15")
         )
     except (TypeError, ValueError):
         leftover_slack = 1.15
@@ -713,20 +781,69 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname):
             f"(leftover ptp={y_ptp:.2f})"
         )
     apply_chemical_rotor_policy(bestdfcn, pname, where=pname)
+
+    rss_fit, const_fit, v_fit, r2_fit = fourier_rss(angs, y, bestdfcn)
+    min_rel = 0.02
+    try:
+        min_rel = float(_os.environ.get("FFPOPT_DIHED_MIN_REL_IMPROVE", "0.02"))
+    except (TypeError, ValueError):
+        min_rel = 0.02
+    orig_ptp = dense_torsion_ptp(orig_dfcn) if orig_dfcn.prims else 0.0
+    keep_orig = False
+    if orig_ptp < 0.05:
+        if r2_fit < 0.05:
+            keep_orig = True
+            print(
+                f"[fit] KEEP ORIG at {pname}: scanned quartet is flat in GAFF "
+                f"and leftover has no Fourier signal (r²={r2_fit:.4f}). "
+                "orig vs itNN _dihed.png will stay flat/identical."
+            )
+    elif rss_fit >= rss_orig * (1.0 - min_rel):
+        keep_orig = True
+        print(
+            f"[fit] KEEP ORIG at {pname}: fitted rss={rss_fit:.4g} "
+            f"does not beat orig rss={rss_orig:.4g} "
+            f"(need {100.0 * min_rel:.1f}% RSS drop). "
+            "parm7 Fourier will stay GAFF — orig vs itNN _dihed.png will match."
+        )
+    if keep_orig:
+        bestdfcn = _pad_to_nprim(copy.deepcopy(orig_dfcn))
+        rss_fit, const_fit, v_fit, r2_fit = fourier_rss(angs, y, bestdfcn)
+
     print(
-        f"[fit] {pname}: PKs={[round(p.fc, 4) for p in bestdfcn.prims]} "
-        f"phases={[p.phase for p in bestdfcn.prims]} "
-        f"ptp={dense_torsion_ptp(bestdfcn):.2f} kcal/mol chisq={bestchisq:.4g}"
+        f"[fit] {pname}: {format_prims(bestdfcn)}  "
+        f"ptp={dense_torsion_ptp(bestdfcn):.2f} kcal/mol "
+        f"rss={rss_fit:.4g} r²={r2_fit:.4f} keep_orig={keep_orig}"
+    )
+    append_fit_trace(
+        {
+            "pname": pname,
+            "idxs": list(idxs),
+            "nprim": int(nprim),
+            "y_ptp": y_ptp,
+            "orig": format_prims(orig_dfcn),
+            "fitted": format_prims(bestdfcn),
+            "rss_orig": rss_orig,
+            "rss_fit": rss_fit,
+            "r2_orig": r2_orig,
+            "r2_fit": r2_fit,
+            "keep_orig": keep_orig,
+            "lam": fit_info.get("lam"),
+            "cond": fit_info.get("cond"),
+            "nprim_sel": fit_info.get("nprim"),
+            "n_irls": fit_info.get("n_irls"),
+        }
     )
 
     fh = open(f"iso.{pname}.dat","w")
     fh.write("# %s\n"%(str(bestdfcn)))
+    fh.write(f"# orig {format_prims(orig_dfcn)}\n")
+    fh.write(f"# keep_orig={keep_orig} rss_orig={rss_orig:.6g} rss_fit={rss_fit:.4g}\n")
     for i in range(npts):
         fh.write("%12.3f %20.10e %20.10e %20.10e\n"%\
                  ( angs[i], hlenes[i], llenes[i],
-                   llenes[i]+bestvalues[i] ) )
+                   llenes[i] + v_fit[i] + const_fit ) )
     fh.close()
-    #exit(0)
     return bestdfcn
     
 
@@ -1657,6 +1774,8 @@ def WriteParmedScript(fname,p,dfcns): #,bytype):
             fh.write("    raise Exception(f\"No atoms matching {mask}\")\n")
             
 
+    n_replace = 0
+    n_skip = 0
     fh.write("\n\n")
     for dfcn in dfcns:
         allmasks = [ [ ":%s@%s"%("{rname}",p.atoms[idx].name)
@@ -1665,12 +1784,27 @@ def WriteParmedScript(fname,p,dfcns): #,bytype):
         for masks in allmasks:
             mstr = ",".join(["f\"%s\""%(mask) for mask in masks])
             nonzero = [prim for prim in dfcn.prims if abs(float(prim.fc)) > 1.0e-8]
+            orig_line = format_parm_quartet(p, dfcn.idxs)
             if not nonzero:
+                n_skip += 1
                 fh.write(
                     f"# skip quartet {dfcn.idxs}: all PKs ~ 0 "
                     "(keep original GAFF terms)\n\n"
                 )
+                print(
+                    f"[fit] script {fname}: SKIP {list(dfcn.idxs)} "
+                    f"(fitted PKs all ~0; orig {orig_line})"
+                )
                 continue
+            n_replace += 1
+            pk_str = ", ".join(
+                f"n={int(prim.per)} PK={float(prim.fc):.4f} γ={float(prim.phase):.0f}"
+                for prim in nonzero
+            )
+            print(
+                f"[fit] script {fname}: REPLACE {list(dfcn.idxs)} "
+                f"{pk_str}  (was {orig_line})"
+            )
             fh.write(f"deleteDihedral(p,{mstr}).execute()\n")
             for prim in nonzero:
                 fh.write(
@@ -1680,6 +1814,14 @@ def WriteParmedScript(fname,p,dfcns): #,bytype):
 
     fh.write("p.save(args.oparm,overwrite=True)\n")
     fh.close()
+    print(
+        f"[fit] WriteParmedScript {fname}: replace={n_replace} skip_zero={n_skip}"
+    )
+    if n_replace == 0:
+        print(
+            f"[fit] WARNING {fname}: no quartet was replaced. "
+            "itNN.parm7 Fourier == origparm; orig vs itNN _dihed.png will match."
+        )
 
     
 

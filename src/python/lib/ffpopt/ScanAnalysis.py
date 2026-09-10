@@ -643,14 +643,38 @@ def compare_scan_files(
                 a_hl, e_hl, a_ll, e_ll, fcn.CptEne
             )
             v_ptp = float(np.max(v_mm) - np.min(v_mm)) if len(v_mm) else 0.0
+            y_ptp = (
+                float(np.max(v_target) - np.min(v_target)) if len(v_target) else 0.0
+            )
+            pks = [round(float(p.fc), 4) for p in fcn.prims]
+            print(
+                f"[plot] dihed PNG={dihed_plot_path} parm={parm_path} "
+                f"idxs={list(dihed_idxs)} HL={hl_path} LL={ll_path}"
+            )
+            print(
+                f"[plot]   MM DIHE ptp={v_ptp:.3f} leftover ptp={y_ptp:.3f} "
+                f"kcal/mol PKs={pks} phases={[round(float(p.phase), 1) for p in fcn.prims]}"
+            )
             if v_ptp < 0.05:
-                pks = [round(float(p.fc), 4) for p in fcn.prims]
                 print(
                     f"[plot] MM DIHE is flat for {list(dihed_idxs)} in "
                     f"{parm_path} (ptp={v_ptp:.3f} kcal/mol, PKs={pks}). "
                     "This quartet has no Fourier amplitude; leftover is "
                     "E_HL-E_MM, not an isolated torsion."
                 )
+                try:
+                    from .Dihedrals import summarize_rotors_on_bond
+
+                    sib = summarize_rotors_on_bond(parm, list(dihed_idxs))
+                    if sib:
+                        print(
+                            "[plot]   proper terms on this central bond "
+                            "(barrier may live on a sibling quartet):"
+                        )
+                        for line in sib:
+                            print(f"[plot] {line}")
+                except Exception:
+                    pass
             dihed_cmp = compare_scans(angles, v_target, angles, v_mm, config=config)
             plot_comparison(
                 angles,

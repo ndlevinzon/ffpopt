@@ -85,11 +85,17 @@ def tikhonov_svd_solve(
     nz = keep & (s > 0)
     filt[nz] = s[nz] / (s[nz] ** 2 + float(lam))
     x = (vt.T * filt) @ (u.T @ y)
+    s_kept = s[keep]
+    smin = float(np.min(s_kept)) if s_kept.size else 0.0
+    cond = (smax / smin) if smin > 0 else float("inf")
     return x, {
         "n_kept": int(np.sum(keep)),
         "s": s,
         "lam": float(lam),
         "rel_cutoff": float(rel_cutoff),
+        "cond": float(cond),
+        "smax": smax,
+        "smin": smin,
     }
 
 
@@ -264,41 +270,9 @@ def _aic(rss: float, npts: int, k: int) -> float:
 
 
 def fit_fourier_nprim(angs, y, nprim_max: int, idxs, pname: str = ""):
-    """AIC-select periods ``1..n`` (phase 0) up to ``nprim_max``."""
+    """AIC-select periods ``1..n`` (signed PK, phase 0) up to ``nprim_max``."""
 
-    from .Dihedrals import GetDihedClasses, MultiDihedFcn, PrimDihedFcn
-
-    angs = np.asarray(angs, dtype=float)
-    y = np.asarray(y, dtype=float).reshape(-1)
-    nprim_max = max(1, int(nprim_max))
-    best = None
-    for nprim in range(1, nprim_max + 1):
-        dfcn = GetDihedClasses(idxs=list(idxs))[nprim][0]
-        npts = y.size
-        A = np.zeros((npts, nprim + 1))
-        for i, prim in enumerate(dfcn.prims):
-            A[:, i] = prim.CptEterm(angs)
-        A[:, nprim] = 1.0
-        x, info = solve_regularized_fcs(
-            A, y, dfcn=dfcn, where=f"{pname}:n{nprim}", n_fc=nprim
-        )
-        v = np.asarray(dfcn.CptEne(angs), dtype=float) + float(x[-1])
-        rss = float(np.dot(y - v, y - v))
-        aic = _aic(rss, npts, nprim + 1)
-        rec = (aic, rss, nprim, dfcn, x, info)
-        if best is None or aic < best[0]:
-            best = rec
-    aic, rss, nprim, dfcn, x, info = best
-    info = dict(info)
-    info["nprim"] = nprim
-    info["aic"] = aic
-    info["rss"] = rss
-    if pname:
-        print(
-            f"[fit] AIC nprim={nprim}/{nprim_max} at {pname}: "
-            f"rss={rss:.4g} aic={aic:.3f} PKs={[round(p.fc, 4) for p in dfcn.prims]}"
-        )
-    return dfcn, x, info
+    return fit_leftover_fourier(angs, y, nprim_max, idxs, pname=pname)
 
 
 def phase_variant_functions(idxs, nprim: int):
@@ -325,3 +299,223 @@ def phase_variant_functions(idxs, nprim: int):
         prims = [PrimDihedFcn(1, ph, n) for n, ph in enumerate(phases, start=1)]
         variants.append(MultiDihedFcn(idxs, prims))
     return variants
+
+
+def format_prims(dfcn) -> str:
+    """Compact ``n=1 PK=... γ=...`` string for logs."""
+
+    if dfcn is None or not getattr(dfcn, "prims", None):
+        return "(no Fourier terms)"
+    parts = []
+    for p in dfcn.prims:
+        parts.append(
+            f"n={int(p.per)} PK={float(p.fc):.4f} γ={float(p.phase):.0f}"
+        )
+    return "; ".join(parts)
+
+
+def design_cosine_matrix(angs, periods, phases=None) -> np.ndarray:
+    """Design matrix ``[cos(n φ + γ), 1]``.
+
+    Amber writes ``PK (1 + cos(nφ + γ))``. The extra ``PK`` is a DC term
+    collinear with a constant column, so fitting ``1+cos`` plus a constant
+    is rank-deficient and invents huge cancelling PKs. Cosine columns
+    plus one intercept recover the same shape with a well-posed SVD.
+    """
+
+    angs = np.asarray(angs, dtype=float).reshape(-1)
+    periods = list(periods)
+    n = len(periods)
+    A = np.empty((angs.size, n + 1), dtype=float)
+    for i, per in enumerate(periods):
+        ph = 0.0 if phases is None else float(phases[i])
+        A[:, i] = np.cos(np.deg2rad(float(per) * angs + ph))
+    A[:, n] = 1.0
+    return A
+
+
+def fourier_rss(angs, y, dfcn) -> tuple[float, float, np.ndarray, float]:
+    """RSS of ``y`` vs ``V(φ)`` after an optimal constant offset."""
+
+    y = np.asarray(y, dtype=float).reshape(-1)
+    if dfcn is None or not getattr(dfcn, "prims", None):
+        v = np.zeros_like(y)
+    else:
+        v = np.asarray(dfcn.CptEne(angs), dtype=float).reshape(-1)
+    c = float(np.mean(y - v))
+    r = y - v - c
+    rss = float(np.dot(r, r))
+    yc = y - float(np.mean(y))
+    tss = float(np.dot(yc, yc))
+    r2 = (1.0 - rss / tss) if tss > 1.0e-16 else 1.0
+    return rss, c, v, r2
+
+
+def _ridge_lambda_override() -> float | None:
+    raw = os.environ.get("FFPOPT_DIHED_RIDGE_LAMBDA")
+    if raw is None or str(raw).strip() == "":
+        return None
+    return float(raw)
+
+
+def _gcv_lambdas(s: np.ndarray) -> list[float]:
+    smax = float(s[0]) if s.size else 1.0
+    base = (smax ** 2) if smax > 0 else 1.0
+    return [0.0, 1.0e-4 * base, 1.0e-3 * base, 1.0e-2 * base, 1.0e-1 * base]
+
+
+def gcv_tikhonov_solve(
+    A: np.ndarray,
+    y: np.ndarray,
+    *,
+    rel_cutoff: float = 1.0e-4,
+    lam: float | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Truncated SVD; GCV-select ``λ`` unless ``lam`` is given."""
+
+    A = np.asarray(A, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    if lam is not None:
+        x, info = tikhonov_svd_solve(A, y, lam=lam, rel_cutoff=rel_cutoff)
+        info = dict(info)
+        info["gcv"] = None
+        return x, info
+
+    u, s, _vt = np.linalg.svd(A, full_matrices=False)
+    n = float(y.size)
+    best = None
+    for lam_try in _gcv_lambdas(s):
+        x, info = tikhonov_svd_solve(A, y, lam=lam_try, rel_cutoff=rel_cutoff)
+        smax = float(s[0]) if s.size else 1.0
+        keep = s >= (float(rel_cutoff) * smax) if smax > 0 else np.zeros(s.shape, dtype=bool)
+        f = np.zeros_like(s)
+        nz = keep & (s > 0)
+        f[nz] = (s[nz] ** 2) / (s[nz] ** 2 + float(lam_try))
+        r = y - A @ x
+        rss = float(np.dot(r, r))
+        n_eff = float(np.sum(f))
+        denom = max(n - n_eff, 1.0)
+        gcv = n * rss / (denom ** 2)
+        rec = (gcv, lam_try, x, info)
+        if best is None or gcv < best[0]:
+            best = rec
+    gcv, lam_try, x, info = best
+    info = dict(info)
+    info["gcv"] = float(gcv)
+    info["lam"] = float(lam_try)
+    return x, info
+
+
+def huber_irls_solve(
+    A: np.ndarray,
+    y: np.ndarray,
+    *,
+    rel_cutoff: float = 1.0e-4,
+    lam: float | None = None,
+    max_iter: int = 8,
+    c: float = 1.345,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Huber IRLS around a GCV/Tikhonov start (down-weights steric outliers)."""
+
+    A = np.asarray(A, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    x, info = gcv_tikhonov_solve(A, y, rel_cutoff=rel_cutoff, lam=lam)
+    lam_fixed = float(info.get("lam", 0.0))
+    n_irls = 0
+    for _ in range(max(0, int(max_iter))):
+        r = y - A @ x
+        med = float(np.median(r))
+        mad = float(np.median(np.abs(r - med)))
+        scale = 1.4826 * mad
+        if scale < 1.0e-10:
+            break
+        u = r / (c * scale)
+        w = np.ones_like(r)
+        big = np.abs(u) > 1.0
+        w[big] = 1.0 / np.abs(u[big])
+        sw = np.sqrt(np.clip(w, 1.0e-8, None))
+        x_new, info = gcv_tikhonov_solve(
+            A * sw[:, None],
+            sw * y,
+            rel_cutoff=rel_cutoff,
+            lam=lam_fixed,
+        )
+        n_irls += 1
+        if float(np.max(np.abs(x_new - x))) < 1.0e-8:
+            x = x_new
+            break
+        x = x_new
+    info = dict(info)
+    info["n_irls"] = n_irls
+    info["lam"] = lam_fixed
+    return x, info
+
+
+def _solve_leftover_linear(A: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    lam = _ridge_lambda_override()
+    if _env_flag("FFPOPT_DIHED_IRLS", default=True):
+        return huber_irls_solve(A, y, lam=lam)
+    return gcv_tikhonov_solve(A, y, lam=lam)
+
+
+def fit_leftover_fourier(angs, y, nprim_max: int, idxs, pname: str = ""):
+    """Fit Amber PKs to isolated leftover with cosine columns, GCV, AIC.
+
+    Signed PK at phase 0° is equivalent (up to a constant) to a 180°
+    term, so the old ``2^nprim`` phase enumeration is unnecessary.
+    """
+
+    from .Dihedrals import GetDihedClasses
+
+    angs = np.asarray(angs, dtype=float).reshape(-1)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    nprim_max = max(1, int(nprim_max))
+    orders = range(1, nprim_max + 1) if nprim_select_enabled() else (nprim_max,)
+    best = None
+    for nprim in orders:
+        dfcn = GetDihedClasses(idxs=list(idxs))[nprim][0]
+        A = design_cosine_matrix(angs, [p.per for p in dfcn.prims])
+        x, info = _solve_leftover_linear(A, y)
+        n_fc = len(dfcn.prims)
+        pks = clip_dihed_fcs(x[:n_fc], where=f"{pname}:n{nprim}" if pname else "")
+        dfcn.SetFCs(pks)
+        rss, const, _v, r2 = fourier_rss(angs, y, dfcn)
+        aic = _aic(rss, y.size, nprim + 1)
+        rec = (aic, rss, nprim, dfcn, x, info, const, r2)
+        if best is None or aic < best[0]:
+            best = rec
+    aic, rss, nprim, dfcn, x, info, const, r2 = best
+    info = dict(info)
+    info["nprim"] = int(nprim)
+    info["aic"] = float(aic)
+    info["rss"] = float(rss)
+    info["r2"] = float(r2)
+    info["const"] = float(const)
+    if pname:
+        print(
+            f"[fit] leftover LS {pname}: nprim={nprim}/{nprim_max} "
+            f"rss={rss:.4g} r²={r2:.4f} aic={aic:.3f} "
+            f"λ={info.get('lam', 0):.3g} cond={info.get('cond', float('nan')):.3g} "
+            f"n_irls={info.get('n_irls', 0)} PKs={[round(p.fc, 4) for p in dfcn.prims]}"
+        )
+        if float(info.get("cond") or 0.0) > 1.0e6:
+            print(
+                f"[fit] WARNING {pname}: design-matrix cond={info['cond']:.3g} "
+                "(clustered φ or rank deficiency); Tikhonov/GCV truncated the null space"
+            )
+    return dfcn, x, info
+
+
+def append_fit_trace(rec: dict, path: str = "fit_trace.jsonl") -> None:
+    """Append one JSON object to the fragment-local fit audit log."""
+
+    import json
+
+    clean = {}
+    for key, val in rec.items():
+        if isinstance(val, np.ndarray):
+            clean[key] = [round(float(v), 6) for v in np.ravel(val)[:64]]
+        else:
+            clean[key] = val
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(clean, default=str) + "\n")

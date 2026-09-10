@@ -650,11 +650,11 @@ def _emit_final_comparisons(
     results["final_comparisons"] = final_comparisons
 
 
-def _log_applied_dihed_delta(origparm, parm_out, scans) -> None:
+def _log_applied_dihed_delta(origparm, parm_out, scans) -> bool:
     """Print orig vs applied Fourier PKs so identical _dihed.png is diagnosable."""
 
     if not scans or not Path(str(origparm)).exists() or not Path(str(parm_out)).exists():
-        return
+        return False
     try:
         import numpy as np
         import parmed
@@ -662,13 +662,13 @@ def _log_applied_dihed_delta(origparm, parm_out, scans) -> None:
         from .DihedFitRegularize import format_prims
     except Exception as exc:
         print(f"[fit] skip parm PK audit ({parm_out}): {exc}")
-        return
+        return False
     try:
         po = parmed.load_file(str(origparm))
         pn = parmed.load_file(str(parm_out))
     except Exception as exc:
         print(f"[fit] skip parm PK audit ({parm_out}): {exc}")
-        return
+        return False
     any_change = False
     angs = np.linspace(0.0, 360.0, 73)
     for scan in scans:
@@ -701,6 +701,51 @@ def _log_applied_dihed_delta(origparm, parm_out, scans) -> None:
             f"[fit] WARNING: {parm_out} Fourier matches {origparm} on every "
             "scanned quartet. Fitting did not change MM DIHE."
         )
+    return any_change
+
+
+def _fourier_changed(parm_a, parm_b, scans) -> bool:
+    """True if any scanned quartet Fourier differs by >0.05 kcal/mol ptp."""
+
+    if not scans:
+        return False
+    if not Path(str(parm_a)).exists() or not Path(str(parm_b)).exists():
+        return True
+    try:
+        import numpy as np
+        import parmed
+        from .Dihedrals import GetMultiDihedFcnFromIdxs
+    except Exception:
+        return True
+    try:
+        pa = parmed.load_file(str(parm_a))
+        pb = parmed.load_file(str(parm_b))
+    except Exception:
+        return True
+    angs = np.linspace(0.0, 360.0, 73)
+    for scan in scans:
+        fa = GetMultiDihedFcnFromIdxs(pa, list(scan.idxs))
+        fb = GetMultiDihedFcnFromIdxs(pb, list(scan.idxs))
+        va = np.asarray(fa.CptEne(angs), dtype=float)
+        vb = np.asarray(fb.CptEne(angs), dtype=float)
+        va = va - float(np.min(va))
+        vb = vb - float(np.min(vb))
+        if float(np.max(np.abs(vb - va))) > 0.05:
+            return True
+    return False
+
+
+def _reuse_ll_scan_files(scans, src_prefix: str, dst_prefix: str) -> None:
+    """Copy previous-iteration scan files so a no-op fit skips wavefront."""
+
+    for scan in scans:
+        idx = scan.GetIdxStr()
+        for ext in (".dat", ".json"):
+            src = Path(f"{src_prefix}_{idx}{ext}")
+            dst = Path(f"{dst_prefix}_{idx}{ext}")
+            if src.exists():
+                shutil.copy2(src, dst)
+                print(f"[twist] reuse {src.name} → {dst.name} (Fourier unchanged)")
 
 
 def _apply_fit_and_prepare(
@@ -1091,16 +1136,23 @@ def run_dihed_twist_workflow(
         )
 
         # 3d. Sander scans on the updated parm (one per bond, "itNN" prefix).
-        it_jobs = _bond_jobs_for_scans(
-            scans,
-            prefix=citname,
-            model="sander",
-            inp=f"{citname}.json",
-            skip_existing=skip_existing,
-            wf_kwargs=wf_kwargs,
-        )
-        for item in _execute_bond_scan_jobs(it_jobs, nproc):
-            results["scans"].append((citname, item["dihed_idxs"], item["result"]))
+        if not _fourier_changed(parm, f"{citname}.parm7", scans):
+            print(
+                f"[twist] {citname}: Fourier matches {ll_prefix} — "
+                "skipping wavefront rescan"
+            )
+            _reuse_ll_scan_files(scans, ll_prefix, citname)
+        else:
+            it_jobs = _bond_jobs_for_scans(
+                scans,
+                prefix=citname,
+                model="sander",
+                inp=f"{citname}.json",
+                skip_existing=skip_existing,
+                wf_kwargs=wf_kwargs,
+            )
+            for item in _execute_bond_scan_jobs(it_jobs, nproc):
+                results["scans"].append((citname, item["dihed_idxs"], item["result"]))
 
         if convergence_mode == "off":
             for scan in scans:

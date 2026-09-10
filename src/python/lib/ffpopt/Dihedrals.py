@@ -860,10 +860,10 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname, instance_idxs=None):
     elif rss_fit >= rss_orig * (1.0 - min_rel):
         keep_orig = True
         print(
-            f"[fit] KEEP ORIG at {pname}: fitted rss={rss_fit:.4g} "
-            f"does not beat orig rss={rss_orig:.4g} "
+            f"[fit] KEEP CURRENT at {pname}: fitted rss={rss_fit:.4g} "
+            f"does not beat current Fourier rss={rss_orig:.4g} "
             f"(need {100.0 * min_rel:.1f}% RSS drop). "
-            "parm7 Fourier will stay GAFF — orig vs itNN _dihed.png will match."
+            "Written PKs stay as in the leftover parm."
         )
     if keep_orig:
         bestdfcn = _pad_to_nprim(copy.deepcopy(orig_dfcn))
@@ -880,6 +880,13 @@ def IsolatedLinearSolve(mol,idxs,losll,hlenes,nprim,pname, instance_idxs=None):
         f"rss={rss_fit:.4g} r²={r2_fit:.4f} keep_orig={keep_orig} "
         f"ninst={len(inst)}"
     )
+    if r2_fit < 0.10:
+        print(
+            f"[fit] leftover is not a Fourier torsion (r²={r2_fit:.3f}). "
+            f"The {y_ptp:.1f} kcal leftover is mostly 1-4/vdw; this type can "
+            f"only move the scan barrier by ~{ptp_eff:.1f} kcal (instance-sum), "
+            "so orig vs itNN one-quartet _dihed.png will stay nearly flat."
+        )
     append_fit_trace(
         {
             "pname": pname,

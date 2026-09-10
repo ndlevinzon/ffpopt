@@ -384,3 +384,26 @@ def test_c3_null_columns_are_dropped():
     assert info.get("dropped_periods") == [1, 2]
     assert all(int(p.per) == 3 for p in dfcn.prims)
     assert max(abs(float(p.fc)) for p in dfcn.prims) < 8.0
+
+
+def test_reuse_ll_scan_files_copies_dat_and_json(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "ffpopt.Workflows", _FFPOPT / "Workflows.py"
+    )
+    wf = importlib.util.module_from_spec(spec)
+    sys.modules["ffpopt.Workflows"] = wf
+    spec.loader.exec_module(wf)
+
+    class _Scan:
+        def __init__(self, idxs):
+            self.idxs = idxs
+
+        def GetIdxStr(self):
+            return "-".join(str(i) for i in self.idxs)
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "it01_1-2-3-4.dat").write_text("scan")
+    (tmp_path / "it01_1-2-3-4.json").write_text("{}")
+    wf._reuse_ll_scan_files([_Scan([1, 2, 3, 4])], "it01", "it02")
+    assert (tmp_path / "it02_1-2-3-4.dat").read_text() == "scan"
+    assert (tmp_path / "it02_1-2-3-4.json").read_text() == "{}"
